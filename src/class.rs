@@ -187,8 +187,8 @@ where Bus: UsbBus
             FIDO_HID_REPORT_DESCRIPTOR_LENGTH as u8, 0x00, // 1st HID report descriptor length in bytes as u16-be
         ])?;
 
-        writer.endpoint(&self.pipe.read_endpoint())?;
-        writer.endpoint(&self.pipe.write_endpoint())?;
+        writer.endpoint(self.pipe.read_endpoint())?;
+        writer.endpoint(self.pipe.write_endpoint())?;
 
         Ok(())
     }
@@ -245,20 +245,17 @@ where Bus: UsbBus
             && req.recipient == control::Recipient::Interface
             && req.index == u8::from(self.interface) as u16
         {
-            match req.request {
-                // GetDescriptor (0x6),
-                // wValue: 0x2200,
-                // wIndex: 0x0,
-                // wLength: 0x22, (34 bytes)
-                control::Request::GET_DESCRIPTOR => {
-                    xfer.accept(|data| {
-                        assert!(data.len() >= FIDO_HID_REPORT_DESCRIPTOR_LENGTH);
-                        data[..FIDO_HID_REPORT_DESCRIPTOR_LENGTH]
-                            .copy_from_slice(&FIDO_HID_REPORT_DESCRIPTOR);
-                        Ok(FIDO_HID_REPORT_DESCRIPTOR_LENGTH)
-                    }).ok();
-                },
-                _ => (),
+            // GetDescriptor (0x6),
+            // wValue: 0x2200,
+            // wIndex: 0x0,
+            // wLength: 0x22, (34 bytes)
+            if req.request == control::Request::GET_DESCRIPTOR  {
+                xfer.accept(|data| {
+                    assert!(data.len() >= FIDO_HID_REPORT_DESCRIPTOR_LENGTH);
+                    data[..FIDO_HID_REPORT_DESCRIPTOR_LENGTH]
+                        .copy_from_slice(&FIDO_HID_REPORT_DESCRIPTOR);
+                    Ok(FIDO_HID_REPORT_DESCRIPTOR_LENGTH)
+                }).ok();
             }
         }
     }

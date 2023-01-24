@@ -321,18 +321,14 @@ impl<'alloc, Bus: UsbBus> Pipe<'alloc, Bus> {
                 self.buffer[..PACKET_SIZE - 7]
                     .copy_from_slice(&packet[7..]);
                 self.state = State::Receiving((current_request, {
-                    let state = MessageState::default();
-                    // info_now!("got {} so far", state.transmitted);
-                    state
+                    MessageState::default()
                 }));
                 // we're done... wait for next packet
-                return;
             } else {
                 // request fits in one packet
                 self.buffer[..length as usize]
                     .copy_from_slice(&packet[7..][..length as usize]);
                 self.dispatch_request(current_request);
-                return;
             }
         } else {
             // case of continuation packet
@@ -366,7 +362,6 @@ impl<'alloc, Bus: UsbBus> Pipe<'alloc, Bus> {
                         message_state.absorb_packet();
                         self.state = State::Receiving((request, message_state));
                         // info_now!("absorbed packet, awaiting next");
-                        return;
                     } else {
                         let missing = request.length as usize - message_state.transmitted;
                         self.buffer[message_state.transmitted..payload_length]
@@ -377,7 +372,6 @@ impl<'alloc, Bus: UsbBus> Pipe<'alloc, Bus> {
                 _ => {
                     // unexpected continuation packet
                     info!("Ignore unexpected cont pkt");
-                    return;
                 },
             }
         }
@@ -388,26 +382,23 @@ impl<'alloc, Bus: UsbBus> Pipe<'alloc, Bus> {
         // so its up to the device to timeout those transactions.
         let last = self.last_milliseconds;
         self.last_milliseconds = milliseconds;
-        match &mut self.state {
-            State::Receiving((request, _message_state)) => {
-                if (milliseconds - last) > 200 {
-                    // If there's a lapse in `check_timeout(...)` getting called (e.g. due to logging),
-                    // this could lead to inaccurate timestamps on requests.  So we'll
-                    // just "forgive" requests temporarily if this happens.
-                    debug!("lapse in hid check.. {} {} {}", request.timestamp, milliseconds, last);
-                    request.timestamp = milliseconds;
-                }
-                // compare keeping in mind of possible overflow in timestamp.
-                else if (milliseconds > request.timestamp && (milliseconds - request.timestamp) > 550)
-                || (milliseconds < request.timestamp && milliseconds > 550)
-                {
-                    debug!("Channel timeout. {}, {}, {}", request.timestamp, milliseconds, last);
-                    let req = *request;
-                    self.start_sending_error(req, AuthenticatorError::Timeout);
-                }
+        if let State::Receiving((request, _message_state)) = &mut self.state {
+            if (milliseconds - last) > 200 {
+                // If there's a lapse in `check_timeout(...)` getting called (e.g. due to logging),
+                // this could lead to inaccurate timestamps on requests.  So we'll
+                // just "forgive" requests temporarily if this happens.
+                debug!("lapse in hid check.. {} {} {}", request.timestamp, milliseconds, last);
+                request.timestamp = milliseconds;
             }
-            _ => { }
-        };
+            // compare keeping in mind of possible overflow in timestamp.
+            else if (milliseconds > request.timestamp && (milliseconds - request.timestamp) > 550)
+            || (milliseconds < request.timestamp && milliseconds > 550)
+            {
+                debug!("Channel timeout. {}, {}, {}", request.timestamp, milliseconds, last);
+                let req = *request;
+                self.start_sending_error(req, AuthenticatorError::Timeout);
+            }
+        }
     }
 
     fn dispatch_request(&mut self, request: Request) {
