@@ -550,13 +550,22 @@ impl<'alloc, Bus: UsbBus> Pipe<'alloc, Bus> {
                     }
 
                     Ok(message) => {
-                        info!(
-                            "Got {} bytes response from authenticator, starting send",
-                            message.len()
-                        );
-                        let response = Response::from_request_and_size(request, message.len());
-                        self.buffer[..message.len()].copy_from_slice(&message);
-                        self.start_sending(response);
+                        if message.len() > self.buffer.len() {
+                            error!(
+                                "Message is longer than buffer ({} > {})",
+                                message.len(),
+                                self.buffer.len(),
+                            );
+                            self.start_sending_error(request, AuthenticatorError::InvalidLength);
+                        } else {
+                            info!(
+                                "Got {} bytes response from authenticator, starting send",
+                                message.len()
+                            );
+                            let response = Response::from_request_and_size(request, message.len());
+                            self.buffer[..message.len()].copy_from_slice(&message);
+                            self.start_sending(response);
+                        }
                     }
                 }
             }
