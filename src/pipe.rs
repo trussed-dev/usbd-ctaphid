@@ -18,11 +18,9 @@ use core::convert::TryInto;
 // pub type ContactlessInterchange = iso14443::types::ApduInterchange;
 
 use ctaphid_dispatch::command::Command;
-use ctaphid_dispatch::types::HidInterchange;
+use ctaphid_dispatch::types::Requester;
 
 use ctap_types::Error as AuthenticatorError;
-
-use interchange::Requester;
 
 // use serde::Serialize;
 use usb_device::{
@@ -128,7 +126,7 @@ pub struct Pipe<'alloc, Bus: UsbBus> {
     write_endpoint: EndpointIn<'alloc, Bus>,
     state: State,
 
-    interchange: Requester<HidInterchange>,
+    interchange: Requester<'static>,
 
     // shared between requests and responses, due to size
     buffer: [u8; MESSAGE_SIZE],
@@ -159,7 +157,7 @@ impl<'alloc, Bus: UsbBus> Pipe<'alloc, Bus> {
     pub(crate) fn new(
         read_endpoint: EndpointOut<'alloc, Bus>,
         write_endpoint: EndpointIn<'alloc, Bus>,
-        interchange: Requester<HidInterchange>,
+        interchange: Requester<'static>,
         initial_milliseconds: u32,
     ) -> Self {
         Self {
@@ -473,7 +471,7 @@ impl<'alloc, Bus: UsbBus> Pipe<'alloc, Bus> {
                     info!("dumping stale response");
                     self.interchange.take_response();
                 }
-                match self.interchange.request(&(
+                match self.interchange.request((
                     request.command,
                     heapless::Vec::from_slice(&self.buffer[..request.length as usize]).unwrap(),
                 )) {
@@ -536,7 +534,7 @@ impl<'alloc, Bus: UsbBus> Pipe<'alloc, Bus> {
     pub fn handle_response(&mut self) {
         if let State::WaitingOnAuthenticator(request) = self.state {
             if let Some(response) = self.interchange.take_response() {
-                match response {
+                match response.0 {
                     Err(ctaphid_dispatch::app::Error::InvalidCommand) => {
                         info!("Got waiting reply from authenticator??");
                         self.start_sending_error(request, AuthenticatorError::InvalidCommand);
