@@ -2,7 +2,6 @@
 // use core::convert::TryFrom as _;
 
 use embedded_time::duration::Extensions;
-use interchange::Requester;
 
 use crate::{
     constants::{INTERRUPT_POLL_MILLISECONDS, PACKET_SIZE},
@@ -10,8 +9,7 @@ use crate::{
     types::Status,
 };
 
-use ctaphid_dispatch::types::HidInterchange;
-
+use ctaphid_dispatch::types::Requester;
 use usb_device::{
     bus::{InterfaceNumber, UsbBus, UsbBusAllocator},
     class::{ControlIn, ControlOut, UsbClass},
@@ -33,7 +31,7 @@ where
 {
     pub fn new(
         allocate: &'alloc UsbBusAllocator<Bus>,
-        interchange: Requester<HidInterchange>,
+        interchange: Requester<'static>,
         initial_milliseconds: u32,
     ) -> Self {
         // 64 bytes, interrupt endpoint polled every 5 milliseconds

@@ -16,7 +16,7 @@ embedded-time = "0.12"
 delog = "0.1.0"
 heapless = "0.7"
 heapless-bytes = "0.3"
-interchange = "0.2.0"
+interchange = "0.3.0"
 serde = { version = "1.0", default-features = false }
 usb-device = "0.2.3"
 
@@ -30,3 +30,6 @@ log-info = []
 log-debug = []
 log-warn = []
 log-error = []
+
+[patch.crates-io]
+ctaphid-dispatch = { git = "https://github.com/sosthene-nitrokey/ctaphid-dispatch.git", rev = "3a8b07212362d6928ba32f211932370abf67d688"}
