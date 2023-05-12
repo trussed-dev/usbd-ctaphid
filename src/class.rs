@@ -20,18 +20,18 @@ use usb_device::{
 };
 
 /// Packet-level implementation of the CTAPHID protocol.
-pub struct CtapHid<'alloc, Bus: UsbBus> {
+pub struct CtapHid<'alloc, 'pipe, Bus: UsbBus> {
     interface: InterfaceNumber,
-    pipe: Pipe<'alloc, Bus>,
+    pipe: Pipe<'alloc, 'pipe, Bus>,
 }
 
-impl<'alloc, Bus> CtapHid<'alloc, Bus>
+impl<'alloc, 'pipe, Bus> CtapHid<'alloc, 'pipe, Bus>
 where
     Bus: UsbBus,
 {
     pub fn new(
         allocate: &'alloc UsbBusAllocator<Bus>,
-        interchange: Requester<'static>,
+        interchange: Requester<'pipe>,
         initial_milliseconds: u32,
     ) -> Self {
         // 64 bytes, interrupt endpoint polled every 5 milliseconds
@@ -78,7 +78,7 @@ where
     }
 
     // implement DerefMut<Target = Pipe> instead
-    pub fn pipe(&mut self) -> &mut Pipe<'alloc, Bus> {
+    pub fn pipe(&mut self) -> &mut Pipe<'alloc, 'pipe, Bus> {
         &mut self.pipe
     }
 
@@ -184,7 +184,7 @@ pub enum ClassRequests {
     SetProtocol = 0xB,
 }
 
-impl<'alloc, Bus> UsbClass<Bus> for CtapHid<'alloc, Bus>
+impl<'alloc, 'pipe, Bus> UsbClass<Bus> for CtapHid<'alloc, 'pipe, Bus>
 where
     Bus: UsbBus,
 {
