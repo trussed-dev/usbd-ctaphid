@@ -14,6 +14,7 @@ No state is maintained between transactions.
 
 use core::convert::TryFrom;
 use core::convert::TryInto;
+use core::sync::atomic::Ordering;
 // pub type ContactInterchange = usbd_ccid::types::ApduInterchange;
 // pub type ContactlessInterchange = iso14443::types::ApduInterchange;
 
@@ -21,7 +22,9 @@ use ctaphid_dispatch::command::Command;
 use ctaphid_dispatch::types::Requester;
 
 use ctap_types::Error as AuthenticatorError;
+use trussed::interrupt::InterruptFlag;
 
+use ref_swap::OptionRefSwap;
 // use serde::Serialize;
 use usb_device::{
     bus::UsbBus,
@@ -121,12 +124,13 @@ pub enum State {
     Sending((Response, MessageState)),
 }
 
-pub struct Pipe<'alloc, 'pipe, Bus: UsbBus> {
+pub struct Pipe<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
     read_endpoint: EndpointOut<'alloc, Bus>,
     write_endpoint: EndpointIn<'alloc, Bus>,
     state: State,
 
     interchange: Requester<'pipe>,
+    interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
 
     // shared between requests and responses, due to size
     buffer: [u8; MESSAGE_SIZE],
@@ -149,11 +153,7 @@ pub struct Pipe<'alloc, 'pipe, Bus: UsbBus> {
     pub(crate) version: crate::Version,
 }
 
-impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, Bus> {
-    // pub fn borrow_mut_authenticator(&mut self) -> &mut Authenticator {
-    //     &mut self.authenticator
-    // }
-
+impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus> {
     pub(crate) fn new(
         read_endpoint: EndpointOut<'alloc, Bus>,
         write_endpoint: EndpointIn<'alloc, Bus>,
@@ -167,6 +167,37 @@ impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, Bus> {
             interchange,
             buffer: [0u8; MESSAGE_SIZE],
             last_channel: 0,
+            interrupt: None,
+            // Default to nothing implemented.
+            implements: 0x80,
+            last_milliseconds: initial_milliseconds,
+            started_processing: false,
+            needs_keepalive: false,
+            version: Default::default(),
+        }
+    }
+}
+
+impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus> {
+    // pub fn borrow_mut_authenticator(&mut self) -> &mut Authenticator {
+    //     &mut self.authenticator
+    // }
+
+    pub(crate) fn with_interrupt(
+        read_endpoint: EndpointOut<'alloc, Bus>,
+        write_endpoint: EndpointIn<'alloc, Bus>,
+        interchange: Requester<'pipe>,
+        interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
+        initial_milliseconds: u32,
+    ) -> Self {
+        Self {
+            read_endpoint,
+            write_endpoint,
+            state: State::Idle,
+            interchange,
+            buffer: [0u8; MESSAGE_SIZE],
+            last_channel: 0,
+            interrupt,
             // Default to nothing implemented.
             implements: 0x80,
             last_milliseconds: initial_milliseconds,
@@ -202,12 +233,10 @@ impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, Bus> {
         // Remove response if it's there
         if let Some(_response) = self.interchange.take_response() {
         } else {
-            // Cancel if there's a request or processing
-            match self.interchange.state() {
-                interchange::State::Requested | interchange::State::BuildingResponse => {
-                    self.interchange.cancel().expect("canceled");
-                }
-                _ => {}
+            info_now!("Interrupting request");
+            if let Some(Some(i)) = self.interrupt.map(|i| i.load(Ordering::Relaxed)) {
+                info_now!("Loadede some interrupter");
+                i.interrupt();
             }
         }
 
@@ -284,19 +313,24 @@ impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, Bus> {
                     State::WaitingOnAuthenticator(request) => request,
                     State::Receiving((request, _message_state)) => request,
                     _ => {
-                        info!("Ignoring transaction as we're already transmitting.");
+                        info_now!("Ignoring transaction as we're already transmitting.");
                         return;
                     }
                 };
                 if packet[4] == 0x86 {
-                    info!("Resyncing!");
+                    info_now!("Resyncing!");
                     self.cancel_ongoing_activity();
                 } else {
                     if channel == request.channel {
-                        info!("Expected seq");
-                        self.start_sending_error(request, AuthenticatorError::InvalidSeq);
+                        if command == Command::Cancel {
+                            info_now!("Cancelling");
+                            self.cancel_ongoing_activity();
+                        } else {
+                            info_now!("Expected seq, {:?}", request.command);
+                            self.start_sending_error(request, AuthenticatorError::InvalidSeq);
+                        }
                     } else {
-                        info!("busy.");
+                        info_now!("busy.");
                         self.send_error_now(current_request, AuthenticatorError::ChannelBusy);
                     }
 
@@ -399,6 +433,7 @@ impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, Bus> {
     }
 
     fn dispatch_request(&mut self, request: Request) {
+        info!("Got request: {:?}", request.command);
         match request.command {
             Command::Init => {}
             _ => {
@@ -459,6 +494,11 @@ impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, Bus> {
             Command::Ping => {
                 let response = Response::from_request_and_size(request, request.length as usize);
                 self.start_sending(response);
+            }
+
+            Command::Cancel => {
+                info!("CTAPHID_CANCEL");
+                self.cancel_ongoing_activity();
             }
 
             _ => {
