@@ -2,6 +2,8 @@
 // use core::convert::TryFrom as _;
 
 use embedded_time::duration::Extensions;
+use ref_swap::OptionRefSwap;
+use trussed::interrupt::InterruptFlag;
 
 use crate::{
     constants::{INTERRUPT_POLL_MILLISECONDS, PACKET_SIZE},
@@ -20,12 +22,12 @@ use usb_device::{
 };
 
 /// Packet-level implementation of the CTAPHID protocol.
-pub struct CtapHid<'alloc, 'pipe, Bus: UsbBus> {
+pub struct CtapHid<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
     interface: InterfaceNumber,
-    pipe: Pipe<'alloc, 'pipe, Bus>,
+    pipe: Pipe<'alloc, 'pipe, 'interrupt, Bus>,
 }
 
-impl<'alloc, 'pipe, Bus> CtapHid<'alloc, 'pipe, Bus>
+impl<'alloc, 'pipe, 'interrupt, Bus> CtapHid<'alloc, 'pipe, 'interrupt, Bus>
 where
     Bus: UsbBus,
 {
@@ -45,6 +47,38 @@ where
             read_endpoint,
             write_endpoint,
             interchange,
+            initial_milliseconds,
+        );
+
+        Self {
+            interface: allocate.interface(),
+            pipe,
+        }
+    }
+}
+
+impl<'alloc, 'pipe, 'interrupt, Bus> CtapHid<'alloc, 'pipe, 'interrupt, Bus>
+where
+    Bus: UsbBus,
+{
+    pub fn with_interrupt(
+        allocate: &'alloc UsbBusAllocator<Bus>,
+        interchange: Requester<'pipe>,
+        interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
+        initial_milliseconds: u32,
+    ) -> Self {
+        // 64 bytes, interrupt endpoint polled every 5 milliseconds
+        let read_endpoint: EndpointOut<'alloc, Bus> =
+            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_MILLISECONDS);
+        // 64 bytes, interrupt endpoint polled every 5 milliseconds
+        let write_endpoint: EndpointIn<'alloc, Bus> =
+            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_MILLISECONDS);
+
+        let pipe = Pipe::with_interrupt(
+            read_endpoint,
+            write_endpoint,
+            interchange,
+            interrupt,
             initial_milliseconds,
         );
 
@@ -78,7 +112,7 @@ where
     }
 
     // implement DerefMut<Target = Pipe> instead
-    pub fn pipe(&mut self) -> &mut Pipe<'alloc, 'pipe, Bus> {
+    pub fn pipe(&mut self) -> &mut Pipe<'alloc, 'pipe, 'interrupt, Bus> {
         &mut self.pipe
     }
 
@@ -184,7 +218,7 @@ pub enum ClassRequests {
     SetProtocol = 0xB,
 }
 
-impl<'alloc, 'pipe, Bus> UsbClass<Bus> for CtapHid<'alloc, 'pipe, Bus>
+impl<'alloc, 'pipe, 'interrupt, Bus> UsbClass<Bus> for CtapHid<'alloc, 'pipe, 'interrupt, Bus>
 where
     Bus: UsbBus,
 {
