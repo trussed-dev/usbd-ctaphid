@@ -19,7 +19,7 @@ heapless-bytes = "0.3"
 interchange = "0.3.0"
 serde = { version = "1.0", default-features = false }
 usb-device = "0.2.3"
-ref-swap = "0.1.1"
+ref-swap = "0.1.2"
 trussed = "0.1.0"
 
 
