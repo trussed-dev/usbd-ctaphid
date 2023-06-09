@@ -235,7 +235,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         } else {
             info_now!("Interrupting request");
             if let Some(Some(i)) = self.interrupt.map(|i| i.load(Ordering::Relaxed)) {
-                info_now!("Loadede some interrupter");
+                info_now!("Loaded some interrupter");
                 i.interrupt();
             }
         }
