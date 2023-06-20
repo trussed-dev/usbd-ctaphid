@@ -32,4 +32,4 @@ log-warn = []
 log-error = []
 
 [patch.crates-io]
-ctaphid-dispatch = { git = "https://github.com/sosthene-nitrokey/ctaphid-dispatch.git", rev = "3a8b07212362d6928ba32f211932370abf67d688"}
+ctaphid-dispatch = { git = "https://github.com/trussed-dev/ctaphid-dispatch.git", rev = "d9eb980da163b613fdf759f6092b7c3bdcc0a22c"}
