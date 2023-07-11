@@ -573,8 +573,8 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     #[inline(never)]
     pub fn handle_response(&mut self) {
         if let State::WaitingOnAuthenticator(request) = self.state {
-            if let Some(response) = self.interchange.take_response() {
-                match response.0 {
+            if let Ok(response) = self.interchange.response() {
+                match &response.0 {
                     Err(ctaphid_dispatch::app::Error::InvalidCommand) => {
                         info!("Got waiting reply from authenticator??");
                         self.start_sending_error(request, AuthenticatorError::InvalidCommand);
