@@ -70,8 +70,12 @@ impl Response {
     }
 
     pub fn error_from_request(request: Request) -> Self {
+        Self::error_on_channel(request.channel)
+    }
+
+    pub fn error_on_channel(channel: u32) -> Self {
         Self {
-            channel: request.channel,
+            channel,
             command: ctaphid_dispatch::command::Command::Error,
             length: 1,
         }
@@ -292,7 +296,8 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 Ok(command) => command,
                 // `solo ls` crashes here as it uses command 0x86
                 Err(_) => {
-                    info!("Ignoring invalid command.");
+                    info!("Received invalid command.");
+                    self.start_sending_error_on_channel(channel, AuthenticatorError::InvalidCommand);
                     return;
                 }
             };
@@ -616,8 +621,12 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     fn start_sending_error(&mut self, request: Request, error: AuthenticatorError) {
+        self.start_sending_error_on_channel(request.channel, error);
+    }
+
+    fn start_sending_error_on_channel(&mut self, channel: u32, error: AuthenticatorError) {
         self.buffer[0] = error as u8;
-        let response = Response::error_from_request(request);
+        let response = Response::error_on_channel(channel);
         self.start_sending(response);
     }
 
