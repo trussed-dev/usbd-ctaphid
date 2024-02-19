@@ -234,17 +234,13 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     fn cancel_ongoing_activity(&mut self) {
-        // Remove response if it's there
-        if let Some(_response) = self.interchange.take_response() {
-        } else {
+        if matches!(self.state, State::WaitingOnAuthenticator(_)) {
             info_now!("Interrupting request");
             if let Some(Some(i)) = self.interrupt.map(|i| i.load(Ordering::Relaxed)) {
                 info_now!("Loaded some interrupter");
                 i.interrupt();
             }
         }
-
-        self.state = State::Idle;
     }
 
     /// This method handles CTAP packets (64 bytes), until it has assembled
