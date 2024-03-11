@@ -12,14 +12,12 @@ receive busy errors).
 No state is maintained between transactions.
 */
 
-use core::convert::TryFrom;
-use core::convert::TryInto;
 use core::sync::atomic::Ordering;
 // pub type ContactInterchange = usbd_ccid::types::ApduInterchange;
 // pub type ContactlessInterchange = iso14443::types::ApduInterchange;
 
 use ctaphid_dispatch::command::Command;
-use ctaphid_dispatch::types::Requester;
+use ctaphid_dispatch::types::{Error as DispatchError, Requester};
 
 use ctap_types::Error as AuthenticatorError;
 use trussed::interrupt::InterruptFlag;
@@ -41,11 +39,12 @@ use crate::{
         PACKET_SIZE,
     },
     types::KeepaliveStatus,
+    Version,
 };
 
 /// The actual payload of given length is dealt with separately
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Request {
+struct Request {
     channel: u32,
     command: Command,
     length: u16,
@@ -54,14 +53,14 @@ pub struct Request {
 
 /// The actual payload of given length is dealt with separately
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Response {
+struct Response {
     channel: u32,
     command: Command,
     length: u16,
 }
 
 impl Response {
-    pub fn from_request_and_size(request: Request, size: usize) -> Self {
+    fn from_request_and_size(request: Request, size: usize) -> Self {
         Self {
             channel: request.channel,
             command: request.command,
@@ -69,21 +68,21 @@ impl Response {
         }
     }
 
-    pub fn error_from_request(request: Request) -> Self {
+    fn error_from_request(request: Request) -> Self {
         Self::error_on_channel(request.channel)
     }
 
-    pub fn error_on_channel(channel: u32) -> Self {
+    fn error_on_channel(channel: u32) -> Self {
         Self {
             channel,
-            command: ctaphid_dispatch::command::Command::Error,
+            command: Command::Error,
             length: 1,
         }
     }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct MessageState {
+struct MessageState {
     // sequence number of next continuation packet
     next_sequence: u8,
     // number of bytes of message payload transmitted so far
@@ -108,8 +107,7 @@ impl MessageState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(unused)]
-pub enum State {
+enum State {
     Idle,
 
     // if request payload data is larger than one packet
@@ -144,21 +142,21 @@ pub struct Pipe<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
     last_channel: u32,
 
     // Indicator of implemented commands in INIT response.
-    pub(crate) implements: u8,
+    implements: u8,
 
     // timestamp that gets used for timing out CID's
-    pub(crate) last_milliseconds: u32,
+    last_milliseconds: u32,
 
     // a "read once" indicator if now we're waiting on the application processing
     started_processing: bool,
 
     needs_keepalive: bool,
 
-    pub(crate) version: crate::Version,
+    version: Version,
 }
 
 impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus> {
-    pub(crate) fn new(
+    pub fn new(
         read_endpoint: EndpointOut<'alloc, Bus>,
         write_endpoint: EndpointIn<'alloc, Bus>,
         interchange: Requester<'pipe>,
@@ -187,7 +185,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     //     &mut self.authenticator
     // }
 
-    pub(crate) fn with_interrupt(
+    pub fn with_interrupt(
         read_endpoint: EndpointOut<'alloc, Bus>,
         write_endpoint: EndpointIn<'alloc, Bus>,
         interchange: Requester<'pipe>,
@@ -211,7 +209,15 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         }
     }
 
-    pub(crate) fn set_version(&mut self, version: crate::Version) {
+    pub fn implements(&self) -> u8 {
+        self.implements
+    }
+
+    pub fn set_implements(&mut self, implements: u8) {
+        self.implements = implements;
+    }
+
+    pub fn set_version(&mut self, version: Version) {
         self.version = version;
     }
 
@@ -224,12 +230,12 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     // used to generate the configuration descriptors
-    pub(crate) fn read_endpoint(&self) -> &EndpointOut<'alloc, Bus> {
+    pub fn read_endpoint(&self) -> &EndpointOut<'alloc, Bus> {
         &self.read_endpoint
     }
 
     // used to generate the configuration descriptors
-    pub(crate) fn write_endpoint(&self) -> &EndpointIn<'alloc, Bus> {
+    pub fn write_endpoint(&self) -> &EndpointIn<'alloc, Bus> {
         &self.write_endpoint
     }
 
@@ -247,7 +253,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     /// a CTAP message, with which it then calls `dispatch_message`.
     ///
     /// During these calls, we can be in states: Idle, Receiving, Dispatching.
-    pub(crate) fn read_and_handle_packet(&mut self) {
+    pub fn read_and_handle_packet(&mut self) {
         // info_now!("got a packet!");
         let mut packet = [0u8; PACKET_SIZE];
         match self.read_endpoint.read(&mut packet) {
@@ -293,7 +299,10 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 // `solo ls` crashes here as it uses command 0x86
                 Err(_) => {
                     info!("Received invalid command.");
-                    self.start_sending_error_on_channel(channel, AuthenticatorError::InvalidCommand);
+                    self.start_sending_error_on_channel(
+                        channel,
+                        AuthenticatorError::InvalidCommand,
+                    );
                     return;
                 }
             };
@@ -503,11 +512,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
             }
 
             _ => {
-                if request.command == Command::Cbor {
-                    self.needs_keepalive = true;
-                } else {
-                    self.needs_keepalive = false;
-                }
+                self.needs_keepalive = request.command == Command::Cbor;
                 if self.interchange.state() == interchange::State::Responded {
                     info!("dumping stale response");
                     self.interchange.take_response();
@@ -576,15 +581,15 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         if let State::WaitingOnAuthenticator(request) = self.state {
             if let Ok(response) = self.interchange.response() {
                 match &response.0 {
-                    Err(ctaphid_dispatch::app::Error::InvalidCommand) => {
+                    Err(DispatchError::InvalidCommand) => {
                         info!("Got waiting reply from authenticator??");
                         self.start_sending_error(request, AuthenticatorError::InvalidCommand);
                     }
-                    Err(ctaphid_dispatch::app::Error::InvalidLength) => {
+                    Err(DispatchError::InvalidLength) => {
                         info!("Error, payload needed app command.");
                         self.start_sending_error(request, AuthenticatorError::InvalidLength);
                     }
-                    Err(ctaphid_dispatch::app::Error::NoResponse) => {
+                    Err(DispatchError::NoResponse) => {
                         info!("Got waiting noresponse from authenticator??");
                     }
 
@@ -602,7 +607,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                                 message.len()
                             );
                             let response = Response::from_request_and_size(request, message.len());
-                            self.buffer[..message.len()].copy_from_slice(&message);
+                            self.buffer[..message.len()].copy_from_slice(message);
                             self.start_sending(response);
                         }
                     }
@@ -641,7 +646,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
 
     // called from poll, and when a packet has been sent
     #[inline(never)]
-    pub(crate) fn maybe_write_packet(&mut self) {
+    pub fn maybe_write_packet(&mut self) {
         match self.state {
             State::WaitingToSend(response) => {
                 // zeros leftover bytes

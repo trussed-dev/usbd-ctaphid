@@ -95,19 +95,19 @@ where
 
     /// Indicate in INIT response that Wink command is implemented.
     pub fn implements_wink(mut self) -> Self {
-        self.pipe.implements |= 0x01;
+        self.pipe.set_implements(self.pipe.implements() | 0x01);
         self
     }
 
     /// Indicate in INIT response that RawMsg command is implemented.
     pub fn implements_ctap1(mut self) -> Self {
-        self.pipe.implements &= !0x80;
+        self.pipe.set_implements(self.pipe.implements() & !0x80);
         self
     }
 
     /// Indicate in INIT response that Cbor command is implemented.
     pub fn implements_ctap2(mut self) -> Self {
-        self.pipe.implements |= 0x04;
+        self.pipe.set_implements(self.pipe.implements() | 0x04);
         self
     }
 
