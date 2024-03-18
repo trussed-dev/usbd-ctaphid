@@ -51,6 +51,24 @@ struct Request {
     timestamp: u32,
 }
 
+impl Request {
+    fn error(self, error: AuthenticatorError) -> PipeError {
+        PipeError {
+            channel: self.channel,
+            error,
+            keep_state: false,
+        }
+    }
+
+    fn error_now(self, error: AuthenticatorError) -> PipeError {
+        PipeError {
+            channel: self.channel,
+            error,
+            keep_state: true,
+        }
+    }
+}
+
 /// The actual payload of given length is dealt with separately
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Response {
@@ -68,15 +86,27 @@ impl Response {
         }
     }
 
-    fn error_from_request(request: Request) -> Self {
-        Self::error_on_channel(request.channel)
-    }
-
     fn error_on_channel(channel: u32) -> Self {
         Self {
             channel,
             command: Command::Error,
             length: 1,
+        }
+    }
+}
+
+struct PipeError {
+    channel: u32,
+    error: AuthenticatorError,
+    keep_state: bool,
+}
+
+impl PipeError {
+    fn on_channel(channel: u32, error: AuthenticatorError) -> Self {
+        Self {
+            channel,
+            error,
+            keep_state: false,
         }
     }
 }
@@ -255,9 +285,15 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     pub fn read_and_handle_packet(&mut self) {
         // info_now!("got a packet!");
         let mut packet = [0u8; PACKET_SIZE];
-        if self.endpoints.read(&mut packet).is_err() {
-            return;
+        if self.endpoints.read(&mut packet).is_ok() {
+            match self.handle_packet(&packet) {
+                Ok(()) => (),
+                Err(error) => self.send_error(error),
+            }
         }
+    }
+
+    fn handle_packet(&mut self, packet: &[u8; 64]) -> Result<(), PipeError> {
         info!(">> ");
         info!("{}", hex_str!(&packet[..16]));
 
@@ -280,11 +316,10 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 // `solo ls` crashes here as it uses command 0x86
                 Err(_) => {
                     info!("Received invalid command.");
-                    self.start_sending_error_on_channel(
+                    return Err(PipeError::on_channel(
                         channel,
                         AuthenticatorError::InvalidCommand,
-                    );
-                    return;
+                    ));
                 }
             };
 
@@ -305,34 +340,32 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                     State::Receiving((request, _message_state)) => request,
                     _ => {
                         info_now!("Ignoring transaction as we're already transmitting.");
-                        return;
+                        return Ok(());
                     }
                 };
                 if packet[4] == 0x86 {
                     info_now!("Resyncing!");
                     self.cancel_ongoing_activity();
                 } else {
-                    if channel == request.channel {
+                    return if channel == request.channel {
                         if command == Command::Cancel {
                             info_now!("Cancelling");
                             self.cancel_ongoing_activity();
+                            Ok(())
                         } else {
                             info_now!("Expected seq, {:?}", request.command);
-                            self.start_sending_error(request, AuthenticatorError::InvalidSeq);
+                            Err(request.error(AuthenticatorError::InvalidSeq))
                         }
                     } else {
                         info_now!("busy.");
-                        self.send_error_now(current_request, AuthenticatorError::ChannelBusy);
-                    }
-
-                    return;
+                        Err(current_request.error_now(AuthenticatorError::ChannelBusy))
+                    };
                 }
             }
 
             if length > MESSAGE_SIZE as u16 {
                 info!("Error message too big.");
-                self.send_error_now(current_request, AuthenticatorError::InvalidLength);
-                return;
+                return Err(current_request.error_now(AuthenticatorError::InvalidLength));
             }
 
             if length > PACKET_SIZE as u16 - 7 {
@@ -341,10 +374,11 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 self.buffer[..PACKET_SIZE - 7].copy_from_slice(&packet[7..]);
                 self.state = State::Receiving((current_request, { MessageState::default() }));
                 // we're done... wait for next packet
+                Ok(())
             } else {
                 // request fits in one packet
                 self.buffer[..length as usize].copy_from_slice(&packet[7..][..length as usize]);
-                self.dispatch_request(current_request);
+                self.dispatch_request(current_request)
             }
         } else {
             // case of continuation packet
@@ -357,15 +391,14 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                         // info_now!("wrong sequence for continuation packet, expected {} received {}",
                         //           message_state.next_sequence, sequence);
                         info!("Error invalid cont pkt");
-                        self.start_sending_error(request, AuthenticatorError::InvalidSeq);
-                        return;
+                        return Err(request.error(AuthenticatorError::InvalidSeq));
                     }
                     if channel != request.channel {
                         // error handling?
                         // info_now!("wrong channel for continuation packet, expected {} received {}",
                         //           request.channel, channel);
                         info!("Ignore invalid channel");
-                        return;
+                        return Ok(());
                     }
 
                     let payload_length = request.length as usize;
@@ -378,16 +411,18 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                         let message_state = message_state.absorb_packet();
                         self.state = State::Receiving((request, message_state));
                         // info_now!("absorbed packet, awaiting next");
+                        Ok(())
                     } else {
                         let missing = request.length as usize - message_state.transmitted;
                         self.buffer[message_state.transmitted..payload_length]
                             .copy_from_slice(&packet[5..][..missing]);
-                        self.dispatch_request(request);
+                        self.dispatch_request(request)
                     }
                 }
                 _ => {
                     // unexpected continuation packet
                     info!("Ignore unexpected cont pkt");
+                    Ok(())
                 }
             }
         }
@@ -418,19 +453,18 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                     request.timestamp, milliseconds, last
                 );
                 let req = *request;
-                self.start_sending_error(req, AuthenticatorError::Timeout);
+                self.send_error(req.error(AuthenticatorError::Timeout));
             }
         }
     }
 
-    fn dispatch_request(&mut self, request: Request) {
+    fn dispatch_request(&mut self, request: Request) -> Result<(), PipeError> {
         info!("Got request: {:?}", request.command);
         match request.command {
             Command::Init => {}
             _ => {
                 if request.channel == 0xffffffff {
-                    self.start_sending_error(request, AuthenticatorError::InvalidChannel);
-                    return;
+                    return Err(request.error(AuthenticatorError::InvalidChannel));
                 }
             }
         }
@@ -442,7 +476,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 match request.channel {
                     0 => {
                         // this is an error / reserved number
-                        self.start_sending_error(request, AuthenticatorError::InvalidChannel);
+                        Err(request.error(AuthenticatorError::InvalidChannel))
                     }
 
                     // broadcast channel ID - request for assignment
@@ -478,6 +512,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                             self.buffer[16] = self.implements;
                             self.start_sending(response);
                         }
+                        Ok(())
                     }
                 }
             }
@@ -485,11 +520,13 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
             Command::Ping => {
                 let response = Response::from_request_and_size(request, request.length as usize);
                 self.start_sending(response);
+                Ok(())
             }
 
             Command::Cancel => {
                 info!("CTAPHID_CANCEL");
                 self.cancel_ongoing_activity();
+                Ok(())
             }
 
             _ => {
@@ -505,12 +542,13 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                     Ok(_) => {
                         self.state = State::WaitingOnAuthenticator(request);
                         self.started_processing = true;
+                        Ok(())
                     }
                     Err(_) => {
                         // busy
                         info_now!("STATE: {:?}", self.interchange.state());
                         info!("can't handle more than one authenticator request at a time.");
-                        self.send_error_now(request, AuthenticatorError::ChannelBusy);
+                        Err(request.error_now(AuthenticatorError::ChannelBusy))
                     }
                 }
             }
@@ -557,21 +595,29 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         }
     }
 
+    pub fn handle_and_write_response(&mut self) {
+        if let Err(err) = self.handle_response() {
+            self.send_error(err);
+        }
+        self.maybe_write_packet();
+    }
+
     #[inline(never)]
-    pub fn handle_response(&mut self) {
+    fn handle_response(&mut self) -> Result<(), PipeError> {
         if let State::WaitingOnAuthenticator(request) = self.state {
             if let Ok(response) = self.interchange.response() {
                 match &response.0 {
                     Err(DispatchError::InvalidCommand) => {
                         info!("Got waiting reply from authenticator??");
-                        self.start_sending_error(request, AuthenticatorError::InvalidCommand);
+                        Err(request.error(AuthenticatorError::InvalidCommand))
                     }
                     Err(DispatchError::InvalidLength) => {
                         info!("Error, payload needed app command.");
-                        self.start_sending_error(request, AuthenticatorError::InvalidLength);
+                        Err(request.error(AuthenticatorError::InvalidLength))
                     }
                     Err(DispatchError::NoResponse) => {
                         info!("Got waiting noresponse from authenticator??");
+                        Ok(())
                     }
 
                     Ok(message) => {
@@ -581,7 +627,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                                 message.len(),
                                 self.buffer.len(),
                             );
-                            self.start_sending_error(request, AuthenticatorError::InvalidLength);
+                            Err(request.error(AuthenticatorError::InvalidLength))
                         } else {
                             info!(
                                 "Got {} bytes response from authenticator, starting send",
@@ -590,10 +636,15 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                             let response = Response::from_request_and_size(request, message.len());
                             self.buffer[..message.len()].copy_from_slice(message);
                             self.start_sending(response);
+                            Ok(())
                         }
                     }
                 }
+            } else {
+                Ok(())
             }
+        } else {
+            Ok(())
         }
     }
 
@@ -602,22 +653,17 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         self.maybe_write_packet();
     }
 
-    fn start_sending_error(&mut self, request: Request, error: AuthenticatorError) {
-        self.start_sending_error_on_channel(request.channel, error);
-    }
-
-    fn start_sending_error_on_channel(&mut self, channel: u32, error: AuthenticatorError) {
-        self.buffer[0] = error as u8;
-        let response = Response::error_on_channel(channel);
-        self.start_sending(response);
-    }
-
-    fn send_error_now(&mut self, request: Request, error: AuthenticatorError) {
-        let response = Response::error_from_request(request);
-        // TODO: should we block?
-        self.endpoints
-            .write(Packet::init(response, &[error as u8]))
-            .ok();
+    fn send_error(&mut self, error: PipeError) {
+        let response = Response::error_on_channel(error.channel);
+        if error.keep_state {
+            // TODO: should we block?
+            self.endpoints
+                .write(Packet::init(response, &[error.error as u8]))
+                .ok();
+        } else {
+            self.buffer[0] = error.error as u8;
+            self.start_sending(response);
+        }
     }
 
     // called from poll, and when a packet has been sent

@@ -253,8 +253,7 @@ where
     #[inline(never)]
     fn poll(&mut self) {
         // debug!("state = {:?}", self.pipe().state);
-        self.pipe.handle_response();
-        self.pipe.maybe_write_packet();
+        self.pipe.handle_and_write_response();
     }
 
     // called when endpoint with given address received a packet
