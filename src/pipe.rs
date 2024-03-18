@@ -100,9 +100,11 @@ impl Default for MessageState {
 
 impl MessageState {
     // update state due to receiving a full new continuation packet
-    pub fn absorb_packet(&mut self) {
+    #[must_use]
+    pub fn absorb_packet(mut self) -> Self {
         self.next_sequence += 1;
         self.transmitted += PACKET_SIZE - 5;
+        self
     }
 }
 
@@ -127,8 +129,7 @@ enum State {
 }
 
 pub struct Pipe<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
-    read_endpoint: EndpointOut<'alloc, Bus>,
-    write_endpoint: EndpointIn<'alloc, Bus>,
+    endpoints: Endpoints<'alloc, Bus>,
     state: State,
 
     interchange: Requester<'pipe>,
@@ -163,8 +164,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         initial_milliseconds: u32,
     ) -> Self {
         Self {
-            read_endpoint,
-            write_endpoint,
+            endpoints: Endpoints::new(read_endpoint, write_endpoint),
             state: State::Idle,
             interchange,
             buffer: [0u8; MESSAGE_SIZE],
@@ -193,8 +193,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         initial_milliseconds: u32,
     ) -> Self {
         Self {
-            read_endpoint,
-            write_endpoint,
+            endpoints: Endpoints::new(read_endpoint, write_endpoint),
             state: State::Idle,
             interchange,
             buffer: [0u8; MESSAGE_SIZE],
@@ -222,21 +221,21 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     pub fn read_address(&self) -> EndpointAddress {
-        self.read_endpoint.address()
+        self.endpoints.read.address()
     }
 
     pub fn write_address(&self) -> EndpointAddress {
-        self.write_endpoint.address()
+        self.endpoints.write.address()
     }
 
     // used to generate the configuration descriptors
     pub fn read_endpoint(&self) -> &EndpointOut<'alloc, Bus> {
-        &self.read_endpoint
+        &self.endpoints.read
     }
 
     // used to generate the configuration descriptors
     pub fn write_endpoint(&self) -> &EndpointIn<'alloc, Bus> {
-        &self.write_endpoint
+        &self.endpoints.write
     }
 
     fn cancel_ongoing_activity(&mut self) {
@@ -256,27 +255,9 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     pub fn read_and_handle_packet(&mut self) {
         // info_now!("got a packet!");
         let mut packet = [0u8; PACKET_SIZE];
-        match self.read_endpoint.read(&mut packet) {
-            Ok(PACKET_SIZE) => {}
-            Ok(_size) => {
-                // error handling?
-                // from spec: "Packets are always fixed size (defined by the endpoint and
-                // HID report descriptors) and although all bytes may not be needed in a
-                // particular packet, the full size always has to be sent.
-                // Unused bytes SHOULD be set to zero."
-                // !("OK but size {}", size);
-                info!("error unexpected size {}", _size);
-                return;
-            }
-            // usb-device lists WouldBlock or BufferOverflow as possible errors.
-            // both should not occur here, and we can't do anything anyway.
-            // Err(UsbError::WouldBlock) => { return; },
-            // Err(UsbError::BufferOverflow) => { return; },
-            Err(_error) => {
-                info!("error no {}", _error as i32);
-                return;
-            }
-        };
+        if self.endpoints.read(&mut packet).is_err() {
+            return;
+        }
         info!(">> ");
         info!("{}", hex_str!(&packet[..16]));
 
@@ -368,7 +349,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         } else {
             // case of continuation packet
             match self.state {
-                State::Receiving((request, mut message_state)) => {
+                State::Receiving((request, message_state)) => {
                     let sequence = packet[4];
                     // info_now!("receiving continuation packet {}", sequence);
                     if sequence != message_state.next_sequence {
@@ -394,7 +375,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                         // store received part of payload
                         self.buffer[message_state.transmitted..][..PACKET_SIZE - 5]
                             .copy_from_slice(&packet[5..]);
-                        message_state.absorb_packet();
+                        let message_state = message_state.absorb_packet();
                         self.state = State::Receiving((request, message_state));
                         // info_now!("absorbed packet, awaiting next");
                     } else {
@@ -554,19 +535,19 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
             } else {
                 info!("keepalive");
 
-                let mut packet = [0u8; PACKET_SIZE];
-
-                packet[..4].copy_from_slice(&request.channel.to_be_bytes());
-                packet[4] = 0x80 | 0x3B;
-                packet[5..7].copy_from_slice(&1u16.to_be_bytes());
-
-                if is_waiting_for_user_presence {
-                    packet[7] = KeepaliveStatus::UpNeeded as u8;
+                let response = Response {
+                    channel: request.channel,
+                    command: Command::KeepAlive,
+                    length: 1,
+                };
+                let status = if is_waiting_for_user_presence {
+                    KeepaliveStatus::UpNeeded
                 } else {
-                    packet[7] = KeepaliveStatus::Processing as u8;
-                }
-
-                self.write_endpoint.write(&packet).ok();
+                    KeepaliveStatus::Processing
+                };
+                self.endpoints
+                    .write(Packet::init(response, &[status as u8]))
+                    .ok();
 
                 true
             }
@@ -647,116 +628,138 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     // called from poll, and when a packet has been sent
     #[inline(never)]
     pub fn maybe_write_packet(&mut self) {
-        match self.state {
-            State::WaitingToSend(response) => {
-                // zeros leftover bytes
-                let mut packet = [0u8; PACKET_SIZE];
-                packet[..4].copy_from_slice(&response.channel.to_be_bytes());
-                // packet[4] = response.command.into() | 0x80u8;
-                packet[4] = response.command.into_u8() | 0x80;
-                packet[5..7].copy_from_slice(&response.length.to_be_bytes());
-
-                let fits_in_one_packet = 7 + response.length as usize <= PACKET_SIZE;
-                if fits_in_one_packet {
-                    packet[7..][..response.length as usize]
-                        .copy_from_slice(&self.buffer[..response.length as usize]);
-                    self.state = State::Idle;
-                } else {
-                    packet[7..].copy_from_slice(&self.buffer[..PACKET_SIZE - 7]);
-                }
-
-                // try actually sending
-                // info_now!("attempting to write init packet {:?}, {:?}",
-                //           &packet[..32], &packet[32..]);
-                let result = self.write_endpoint.write(&packet);
-
-                match result {
-                    Err(UsbError::WouldBlock) => {
-                        // fine, can't write try later
-                        // this shouldn't happen probably
-                        info!("hid usb WouldBlock");
-                    }
-                    Err(_) => {
-                        // info_now!("weird USB errrorrr");
-                        panic!("unexpected error writing packet!");
-                    }
-                    Ok(PACKET_SIZE) => {
-                        // goodie, this worked
-                        if fits_in_one_packet {
-                            self.state = State::Idle;
-                            // info_now!("StartSent {} bytes, idle again", response.length);
-                            // info_now!("IDLE again");
-                        } else {
-                            self.state = State::Sending((response, MessageState::default()));
-                            // info_now!(
-                            //     "StartSent {} of {} bytes, waiting to send again",
-                            //     PACKET_SIZE - 7, response.length);
-                            // info_now!("State: {:?}", &self.state);
-                        }
-                    }
-                    Ok(_) => {
-                        // info_now!("short write");
-                        panic!("unexpected size writing packet!");
-                    }
-                };
+        let packet = match self.state {
+            State::WaitingToSend(response) => Packet::init(response, &self.buffer),
+            State::Sending((response, message_state)) => {
+                Packet::cont(response, message_state, &self.buffer)
             }
-
-            State::Sending((response, mut message_state)) => {
-                // info_now!("in StillSending");
-                let mut packet = [0u8; PACKET_SIZE];
-                packet[..4].copy_from_slice(&response.channel.to_be_bytes());
-                packet[4] = message_state.next_sequence;
-
-                let sent = message_state.transmitted;
-                let remaining = response.length as usize - sent;
-                let last_packet = 5 + remaining <= PACKET_SIZE;
-                if last_packet {
-                    packet[5..][..remaining]
-                        .copy_from_slice(&self.buffer[message_state.transmitted..][..remaining]);
-                } else {
-                    packet[5..].copy_from_slice(
-                        &self.buffer[message_state.transmitted..][..PACKET_SIZE - 5],
-                    );
-                }
-
-                // try actually sending
-                // info_now!("attempting to write cont packet {:?}, {:?}",
-                //           &packet[..32], &packet[32..]);
-                let result = self.write_endpoint.write(&packet);
-
-                match result {
-                    Err(UsbError::WouldBlock) => {
-                        // fine, can't write try later
-                        // this shouldn't happen probably
-                        // info_now!("can't send seq {}, write endpoint busy",
-                        //           message_state.next_sequence);
-                    }
-                    Err(_) => {
-                        // info_now!("weird USB error");
-                        panic!("unexpected error writing packet!");
-                    }
-                    Ok(PACKET_SIZE) => {
-                        // goodie, this worked
-                        if last_packet {
-                            self.state = State::Idle;
-                            // info_now!("in IDLE state after {:?}", &message_state);
-                        } else {
-                            message_state.absorb_packet();
-                            // DANGER! destructuring in the match arm copies out
-                            // message state, so need to update state
-                            // info_now!("sent one more, now {:?}", &message_state);
-                            self.state = State::Sending((response, message_state));
-                        }
-                    }
-                    Ok(_) => {
-                        debug!("short write");
-                        panic!("unexpected size writing packet!");
-                    }
-                };
-            }
-
             // nothing to send
-            _ => {}
+            _ => {
+                return;
+            }
+        };
+        if self.endpoints.write(packet).is_ok() {
+            self.state = packet.next_state();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Packet<'a> {
+    response: Response,
+    message_state: Option<MessageState>,
+    buffer: &'a [u8],
+}
+
+impl<'a> Packet<'a> {
+    fn init(response: Response, buffer: &'a [u8]) -> Self {
+        Self {
+            response,
+            message_state: None,
+            buffer,
+        }
+    }
+
+    fn cont(response: Response, message_state: MessageState, buffer: &'a [u8]) -> Self {
+        Self {
+            response,
+            message_state: Some(message_state),
+            buffer,
+        }
+    }
+
+    fn has_more(&self) -> bool {
+        if let Some(message_state) = self.message_state {
+            let remaining = usize::from(self.response.length) - message_state.transmitted;
+            remaining > PACKET_SIZE - 5
+        } else {
+            usize::from(self.response.length) > PACKET_SIZE - 7
+        }
+    }
+
+    fn next_state(&self) -> State {
+        if self.has_more() {
+            let message_state = self
+                .message_state
+                .map(MessageState::absorb_packet)
+                .unwrap_or_default();
+            State::Sending((self.response, message_state))
+        } else {
+            State::Idle
+        }
+    }
+
+    fn serialize(&self, buffer: &mut [u8; PACKET_SIZE]) {
+        // buffer must be zeroed
+        buffer[..4].copy_from_slice(&self.response.channel.to_be_bytes());
+        if let Some(message_state) = self.message_state {
+            buffer[4] = message_state.next_sequence;
+            let remaining = usize::from(self.response.length) - message_state.transmitted;
+            let n = remaining.min(PACKET_SIZE - 5);
+            buffer[5..][..n].copy_from_slice(&self.buffer[message_state.transmitted..][..n]);
+        } else {
+            buffer[4] = self.response.command.into_u8() | 0x80;
+            buffer[5..7].copy_from_slice(&self.response.length.to_be_bytes());
+            let n = usize::from(self.response.length).min(PACKET_SIZE - 7);
+            buffer[7..][..n].copy_from_slice(&self.buffer[..n]);
+        }
+    }
+}
+
+struct Endpoints<'a, Bus: UsbBus> {
+    read: EndpointOut<'a, Bus>,
+    write: EndpointIn<'a, Bus>,
+}
+
+impl<'a, Bus: UsbBus> Endpoints<'a, Bus> {
+    fn new(read: EndpointOut<'a, Bus>, write: EndpointIn<'a, Bus>) -> Self {
+        Self { read, write }
+    }
+
+    fn read(&mut self, packet: &mut [u8; PACKET_SIZE]) -> Result<(), ()> {
+        match self.read.read(packet) {
+            Ok(PACKET_SIZE) => Ok(()),
+            Ok(_size) => {
+                // error handling?
+                // from spec: "Packets are always fixed size (defined by the endpoint and
+                // HID report descriptors) and although all bytes may not be needed in a
+                // particular packet, the full size always has to be sent.
+                // Unused bytes SHOULD be set to zero."
+                // !("OK but size {}", size);
+                info!("error unexpected size {}", _size);
+                Err(())
+            }
+            // usb-device lists WouldBlock or BufferOverflow as possible errors.
+            // both should not occur here, and we can't do anything anyway.
+            // Err(UsbError::WouldBlock) => { return; },
+            // Err(UsbError::BufferOverflow) => { return; },
+            Err(_error) => {
+                info!("error no {}", _error as i32);
+                Err(())
+            }
+        }
+    }
+
+    fn write(&mut self, packet: Packet<'_>) -> Result<(), ()> {
+        // zeros leftover bytes
+        let mut buffer = [0u8; PACKET_SIZE];
+        packet.serialize(&mut buffer);
+        match self.write.write(&buffer) {
+            Ok(PACKET_SIZE) => Ok(()),
+            Ok(_) => {
+                error!("short write");
+                panic!("unexpected size writing packet!");
+            }
+            Err(UsbError::WouldBlock) => {
+                // fine, can't write try later
+                // this shouldn't happen probably
+                info!("hid usb WouldBlock");
+                Err(())
+            }
+            Err(_) => {
+                // info_now!("weird USB error");
+                panic!("unexpected error writing packet!");
+            }
         }
     }
 }
