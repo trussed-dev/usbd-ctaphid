@@ -613,16 +613,11 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     fn send_error_now(&mut self, request: Request, error: AuthenticatorError) {
-        let last_state = core::mem::replace(&mut self.state, State::Idle);
-        let last_first_byte = self.buffer[0];
-
-        self.buffer[0] = error as u8;
         let response = Response::error_from_request(request);
-        self.start_sending(response);
-        self.maybe_write_packet();
-
-        self.state = last_state;
-        self.buffer[0] = last_first_byte;
+        // TODO: should we block?
+        self.endpoints
+            .write(Packet::init(response, &[error as u8]))
+            .ok();
     }
 
     // called from poll, and when a packet has been sent
