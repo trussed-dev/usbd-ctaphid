@@ -287,13 +287,14 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         let mut packet = [0u8; PACKET_SIZE];
         if self.endpoints.read(&mut packet).is_ok() {
             match self.handle_packet(&packet) {
-                Ok(()) => (),
+                Ok(Some(response)) => self.start_sending(response),
+                Ok(None) => (),
                 Err(error) => self.send_error(error),
             }
         }
     }
 
-    fn handle_packet(&mut self, packet: &[u8; 64]) -> Result<(), PipeError> {
+    fn handle_packet(&mut self, packet: &[u8; 64]) -> Result<Option<Response>, PipeError> {
         info!(">> ");
         info!("{}", hex_str!(&packet[..16]));
 
@@ -340,7 +341,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                     State::Receiving((request, _message_state)) => request,
                     _ => {
                         info_now!("Ignoring transaction as we're already transmitting.");
-                        return Ok(());
+                        return Ok(None);
                     }
                 };
                 if packet[4] == 0x86 {
@@ -351,7 +352,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                         if command == Command::Cancel {
                             info_now!("Cancelling");
                             self.cancel_ongoing_activity();
-                            Ok(())
+                            Ok(None)
                         } else {
                             info_now!("Expected seq, {:?}", request.command);
                             Err(request.error(AuthenticatorError::InvalidSeq))
@@ -374,7 +375,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 self.buffer[..PACKET_SIZE - 7].copy_from_slice(&packet[7..]);
                 self.state = State::Receiving((current_request, { MessageState::default() }));
                 // we're done... wait for next packet
-                Ok(())
+                Ok(None)
             } else {
                 // request fits in one packet
                 self.buffer[..length as usize].copy_from_slice(&packet[7..][..length as usize]);
@@ -398,7 +399,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                         // info_now!("wrong channel for continuation packet, expected {} received {}",
                         //           request.channel, channel);
                         info!("Ignore invalid channel");
-                        return Ok(());
+                        return Ok(None);
                     }
 
                     let payload_length = request.length as usize;
@@ -411,7 +412,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                         let message_state = message_state.absorb_packet();
                         self.state = State::Receiving((request, message_state));
                         // info_now!("absorbed packet, awaiting next");
-                        Ok(())
+                        Ok(None)
                     } else {
                         let missing = request.length as usize - message_state.transmitted;
                         self.buffer[message_state.transmitted..payload_length]
@@ -422,7 +423,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 _ => {
                     // unexpected continuation packet
                     info!("Ignore unexpected cont pkt");
-                    Ok(())
+                    Ok(None)
                 }
             }
         }
@@ -458,7 +459,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
         }
     }
 
-    fn dispatch_request(&mut self, request: Request) -> Result<(), PipeError> {
+    fn dispatch_request(&mut self, request: Request) -> Result<Option<Response>, PipeError> {
         info!("Got request: {:?}", request.command);
         match request.command {
             Command::Init => {}
@@ -484,6 +485,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                         if request.length != 8 {
                             // error
                             info!("Invalid length for init.  ignore.");
+                            Ok(None)
                         } else {
                             self.last_channel += 1;
                             // info_now!(
@@ -510,23 +512,21 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                             // 0x8: does not implement MSG
                             // self.buffer[16] = 0x01 | 0x08;
                             self.buffer[16] = self.implements;
-                            self.start_sending(response);
+                            Ok(Some(response))
                         }
-                        Ok(())
                     }
                 }
             }
 
             Command::Ping => {
                 let response = Response::from_request_and_size(request, request.length as usize);
-                self.start_sending(response);
-                Ok(())
+                Ok(Some(response))
             }
 
             Command::Cancel => {
                 info!("CTAPHID_CANCEL");
                 self.cancel_ongoing_activity();
-                Ok(())
+                Ok(None)
             }
 
             _ => {
@@ -542,7 +542,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                     Ok(_) => {
                         self.state = State::WaitingOnAuthenticator(request);
                         self.started_processing = true;
-                        Ok(())
+                        Ok(None)
                     }
                     Err(_) => {
                         // busy
@@ -596,14 +596,15 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     pub fn handle_and_write_response(&mut self) {
-        if let Err(err) = self.handle_response() {
-            self.send_error(err);
+        match self.handle_response() {
+            Ok(Some(response)) => self.start_sending(response),
+            Ok(None) => (),
+            Err(error) => self.send_error(error),
         }
-        self.maybe_write_packet();
     }
 
     #[inline(never)]
-    fn handle_response(&mut self) -> Result<(), PipeError> {
+    fn handle_response(&mut self) -> Result<Option<Response>, PipeError> {
         if let State::WaitingOnAuthenticator(request) = self.state {
             if let Ok(response) = self.interchange.response() {
                 match &response.0 {
@@ -617,7 +618,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                     }
                     Err(DispatchError::NoResponse) => {
                         info!("Got waiting noresponse from authenticator??");
-                        Ok(())
+                        Ok(None)
                     }
 
                     Ok(message) => {
@@ -635,16 +636,15 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                             );
                             let response = Response::from_request_and_size(request, message.len());
                             self.buffer[..message.len()].copy_from_slice(message);
-                            self.start_sending(response);
-                            Ok(())
+                            Ok(Some(response))
                         }
                     }
                 }
             } else {
-                Ok(())
+                Ok(None)
             }
         } else {
-            Ok(())
+            Ok(None)
         }
     }
 
