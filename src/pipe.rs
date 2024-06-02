@@ -21,7 +21,6 @@ use core::sync::atomic::Ordering;
 use ctaphid_dispatch::command::Command;
 use ctaphid_dispatch::types::Requester;
 
-use ctap_types::Error as AuthenticatorError;
 use trussed::interrupt::InterruptFlag;
 
 use ref_swap::OptionRefSwap;
@@ -42,6 +41,30 @@ use crate::{
     },
     types::KeepaliveStatus,
 };
+
+// https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#usb-hid-error
+// unused variants: InvalidParameter, LockRequired, Other
+enum AuthenticatorError {
+    ChannelBusy,
+    InvalidChannel,
+    InvalidCommand,
+    InvalidLength,
+    InvalidSeq,
+    Timeout,
+}
+
+impl From<AuthenticatorError> for u8 {
+    fn from(error: AuthenticatorError) -> Self {
+        match error {
+            AuthenticatorError::InvalidCommand => 0x01,
+            AuthenticatorError::InvalidLength => 0x03,
+            AuthenticatorError::InvalidSeq => 0x04,
+            AuthenticatorError::Timeout => 0x05,
+            AuthenticatorError::ChannelBusy => 0x06,
+            AuthenticatorError::InvalidChannel => 0x0B,
+        }
+    }
+}
 
 /// The actual payload of given length is dealt with separately
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -621,7 +644,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     fn start_sending_error_on_channel(&mut self, channel: u32, error: AuthenticatorError) {
-        self.buffer[0] = error as u8;
+        self.buffer[0] = error.into();
         let response = Response::error_on_channel(channel);
         self.start_sending(response);
     }
