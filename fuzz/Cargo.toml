@@ -1,0 +1,26 @@
+[package]
+name = "usbd-ctaphid-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ctaphid-dispatch = "0.1.0"
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+
+[dependencies.usbd-ctaphid]
+path = ".."
+
+[[bin]]
+name = "buffer"
+path = "fuzz_targets/buffer.rs"
+test = false
+doc = false
+bench = false
+
+[patch.crates-io]
+ctaphid-dispatch = { git = "https://github.com/trussed-dev/ctaphid-dispatch.git", rev = "57cb3317878a8593847595319aa03ef17c29ec5b" }
+trussed = { git = "https://github.com/trussed-dev/trussed.git", rev = "51e68500d7601d04f884f5e95567d14b9018a6cb" }

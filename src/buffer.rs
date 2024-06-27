@@ -212,7 +212,7 @@ impl<'pipe, 'interrupt> Buffer<'pipe, 'interrupt> {
         // so its up to the device to timeout those transactions.
         let last = core::mem::replace(&mut self.last_milliseconds, milliseconds);
         if let State::Receiving((request, message_state)) = &self.state {
-            if (milliseconds - last) > 200 {
+            if milliseconds.saturating_sub(last) > 200 {
                 // If there's a lapse in `check_timeout(...)` getting called (e.g. due to logging),
                 // this could lead to inaccurate timestamps on requests.  So we'll
                 // just "forgive" requests temporarily if this happens.
