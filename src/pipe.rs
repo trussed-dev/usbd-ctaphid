@@ -21,6 +21,7 @@ use core::sync::atomic::Ordering;
 use ctaphid_dispatch::command::Command;
 use ctaphid_dispatch::types::Requester;
 
+use ctap_types::Error as AuthenticatorError;
 use trussed::interrupt::InterruptFlag;
 
 use ref_swap::OptionRefSwap;
@@ -41,30 +42,6 @@ use crate::{
     },
     types::KeepaliveStatus,
 };
-
-// https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#usb-hid-error
-// unused variants: InvalidParameter, LockRequired, Other
-enum AuthenticatorError {
-    ChannelBusy,
-    InvalidChannel,
-    InvalidCommand,
-    InvalidLength,
-    InvalidSeq,
-    Timeout,
-}
-
-impl From<AuthenticatorError> for u8 {
-    fn from(error: AuthenticatorError) -> Self {
-        match error {
-            AuthenticatorError::InvalidCommand => 0x01,
-            AuthenticatorError::InvalidLength => 0x03,
-            AuthenticatorError::InvalidSeq => 0x04,
-            AuthenticatorError::Timeout => 0x05,
-            AuthenticatorError::ChannelBusy => 0x06,
-            AuthenticatorError::InvalidChannel => 0x0B,
-        }
-    }
-}
 
 /// The actual payload of given length is dealt with separately
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -93,12 +70,8 @@ impl Response {
     }
 
     pub fn error_from_request(request: Request) -> Self {
-        Self::error_on_channel(request.channel)
-    }
-
-    pub fn error_on_channel(channel: u32) -> Self {
         Self {
-            channel,
+            channel: request.channel,
             command: ctaphid_dispatch::command::Command::Error,
             length: 1,
         }
@@ -257,13 +230,17 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     fn cancel_ongoing_activity(&mut self) {
-        if matches!(self.state, State::WaitingOnAuthenticator(_)) {
+        // Remove response if it's there
+        if let Some(_response) = self.interchange.take_response() {
+        } else {
             info_now!("Interrupting request");
             if let Some(Some(i)) = self.interrupt.map(|i| i.load(Ordering::Relaxed)) {
                 info_now!("Loaded some interrupter");
                 i.interrupt();
             }
         }
+
+        self.state = State::Idle;
     }
 
     /// This method handles CTAP packets (64 bytes), until it has assembled
@@ -315,8 +292,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 Ok(command) => command,
                 // `solo ls` crashes here as it uses command 0x86
                 Err(_) => {
-                    info!("Received invalid command.");
-                    self.start_sending_error_on_channel(channel, AuthenticatorError::InvalidCommand);
+                    info!("Ignoring invalid command.");
                     return;
                 }
             };
@@ -640,12 +616,8 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     }
 
     fn start_sending_error(&mut self, request: Request, error: AuthenticatorError) {
-        self.start_sending_error_on_channel(request.channel, error);
-    }
-
-    fn start_sending_error_on_channel(&mut self, channel: u32, error: AuthenticatorError) {
-        self.buffer[0] = error.into();
-        let response = Response::error_on_channel(channel);
+        self.buffer[0] = error as u8;
+        let response = Response::error_from_request(request);
         self.start_sending(response);
     }
 

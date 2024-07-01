@@ -10,6 +10,7 @@ description = "usb-device driver for CTAPHID"
 categories = ["embedded", "no-std"]
 
 [dependencies]
+ctap-types = "0.1.0"
 ctaphid-dispatch = "0.1.0"
 embedded-time = "0.12"
 delog = "0.1.0"
