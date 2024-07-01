@@ -2,4 +2,5 @@ pub const INTERRUPT_POLL_MILLISECONDS: u8 = 5;
 
 pub const PACKET_SIZE: usize = 64;
 
-pub const MESSAGE_SIZE: usize = 3072;
+// 7609
+pub const MESSAGE_SIZE: usize = PACKET_SIZE - 7 + 128 * (PACKET_SIZE - 5);
