@@ -3,7 +3,7 @@
 
 use embedded_time::duration::Extensions;
 use ref_swap::OptionRefSwap;
-use trussed::interrupt::InterruptFlag;
+use trussed_core::InterruptFlag;
 
 use crate::{
     constants::{INTERRUPT_POLL_MILLISECONDS, PACKET_SIZE},

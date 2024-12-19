@@ -20,10 +20,9 @@ use core::sync::atomic::Ordering;
 
 use ctaphid_dispatch::command::Command;
 use ctaphid_dispatch::types::Requester;
-
-use trussed::interrupt::InterruptFlag;
-
+use heapless_bytes::Bytes;
 use ref_swap::OptionRefSwap;
+use trussed_core::InterruptFlag;
 // use serde::Serialize;
 use usb_device::{
     bus::UsbBus,
@@ -536,7 +535,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 }
                 match self.interchange.request((
                     request.command,
-                    heapless::Vec::from_slice(&self.buffer[..request.length as usize]).unwrap(),
+                    Bytes::from_slice(&self.buffer[..request.length as usize]).unwrap(),
                 )) {
                     Ok(_) => {
                         self.state = State::WaitingOnAuthenticator(request);
