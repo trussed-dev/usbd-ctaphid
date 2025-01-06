@@ -180,7 +180,7 @@ pub struct Pipe<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
     pub(crate) version: crate::Version,
 }
 
-impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus> {
+impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, '_, Bus> {
     pub(crate) fn new(
         read_endpoint: EndpointOut<'alloc, Bus>,
         write_endpoint: EndpointIn<'alloc, Bus>,
@@ -316,7 +316,10 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 // `solo ls` crashes here as it uses command 0x86
                 Err(_) => {
                     info!("Received invalid command.");
-                    self.start_sending_error_on_channel(channel, AuthenticatorError::InvalidCommand);
+                    self.start_sending_error_on_channel(
+                        channel,
+                        AuthenticatorError::InvalidCommand,
+                    );
                     return;
                 }
             };
@@ -526,11 +529,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
             }
 
             _ => {
-                if request.command == Command::Cbor {
-                    self.needs_keepalive = true;
-                } else {
-                    self.needs_keepalive = false;
-                }
+                self.needs_keepalive = request.command == Command::Cbor;
                 if self.interchange.state() == interchange::State::Responded {
                     info!("dumping stale response");
                     self.interchange.take_response();
@@ -625,7 +624,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                                 message.len()
                             );
                             let response = Response::from_request_and_size(request, message.len());
-                            self.buffer[..message.len()].copy_from_slice(&message);
+                            self.buffer[..message.len()].copy_from_slice(message);
                             self.start_sending(response);
                         }
                     }

@@ -27,7 +27,7 @@ pub struct CtapHid<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
     pipe: Pipe<'alloc, 'pipe, 'interrupt, Bus>,
 }
 
-impl<'alloc, 'pipe, 'interrupt, Bus> CtapHid<'alloc, 'pipe, 'interrupt, Bus>
+impl<'alloc, 'pipe, Bus> CtapHid<'alloc, 'pipe, '_, Bus>
 where
     Bus: UsbBus,
 {
@@ -218,7 +218,7 @@ pub enum ClassRequests {
     SetProtocol = 0xB,
 }
 
-impl<'alloc, 'pipe, 'interrupt, Bus> UsbClass<Bus> for CtapHid<'alloc, 'pipe, 'interrupt, Bus>
+impl<Bus> UsbClass<Bus> for CtapHid<'_, '_, '_, Bus>
 where
     Bus: UsbBus,
 {
