@@ -10,7 +10,7 @@ description = "usb-device driver for CTAPHID"
 categories = ["embedded", "no-std"]
 
 [dependencies]
-ctaphid-dispatch = "0.1.0"
+ctaphid-dispatch = "0.2"
 embedded-time = "0.12"
 delog = "0.1.0"
 heapless-bytes = "0.3"
@@ -18,7 +18,7 @@ interchange = "0.3.0"
 serde = { version = "1.0", default-features = false }
 usb-device = "0.2.3"
 ref-swap = "0.1.2"
-trussed-core = "0.1.0-rc.1"
+trussed-core = "0.1"
 
 
 [features]
@@ -30,6 +30,3 @@ log-info = []
 log-debug = []
 log-warn = []
 log-error = []
-
-[patch.crates-io]
-ctaphid-dispatch = { git = "https://github.com/trussed-dev/ctaphid-dispatch.git", rev = "5a2864c76fea6785d9ffe4c7b6596237d8378755" }

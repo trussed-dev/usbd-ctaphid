@@ -18,8 +18,7 @@ use core::sync::atomic::Ordering;
 // pub type ContactInterchange = usbd_ccid::types::ApduInterchange;
 // pub type ContactlessInterchange = iso14443::types::ApduInterchange;
 
-use ctaphid_dispatch::command::Command;
-use ctaphid_dispatch::types::Requester;
+use ctaphid_dispatch::{app::Command, Requester};
 use heapless_bytes::Bytes;
 use ref_swap::OptionRefSwap;
 use trussed_core::InterruptFlag;
@@ -98,7 +97,7 @@ impl Response {
     pub fn error_on_channel(channel: u32) -> Self {
         Self {
             channel,
-            command: ctaphid_dispatch::command::Command::Error,
+            command: ctaphid_dispatch::app::Command::Error,
             length: 1,
         }
     }

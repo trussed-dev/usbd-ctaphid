@@ -11,7 +11,7 @@ use crate::{
     types::Status,
 };
 
-use ctaphid_dispatch::types::Requester;
+use ctaphid_dispatch::Requester;
 use usb_device::{
     bus::{InterfaceNumber, UsbBus, UsbBusAllocator},
     class::{ControlIn, ControlOut, UsbClass},
