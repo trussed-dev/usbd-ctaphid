@@ -22,18 +22,18 @@ use usb_device::{
 };
 
 /// Packet-level implementation of the CTAPHID protocol.
-pub struct CtapHid<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
+pub struct CtapHid<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize> {
     interface: InterfaceNumber,
-    pipe: Pipe<'alloc, 'pipe, 'interrupt, Bus>,
+    pipe: Pipe<'alloc, 'pipe, 'interrupt, Bus, N>,
 }
 
-impl<'alloc, 'pipe, Bus> CtapHid<'alloc, 'pipe, '_, Bus>
+impl<'alloc, 'pipe, Bus, const N: usize> CtapHid<'alloc, 'pipe, '_, Bus, N>
 where
     Bus: UsbBus,
 {
     pub fn new(
         allocate: &'alloc UsbBusAllocator<Bus>,
-        interchange: Requester<'pipe>,
+        interchange: Requester<'pipe, N>,
         initial_milliseconds: u32,
     ) -> Self {
         // 64 bytes, interrupt endpoint polled every 5 milliseconds
@@ -57,13 +57,13 @@ where
     }
 }
 
-impl<'alloc, 'pipe, 'interrupt, Bus> CtapHid<'alloc, 'pipe, 'interrupt, Bus>
+impl<'alloc, 'pipe, 'interrupt, Bus, const N: usize> CtapHid<'alloc, 'pipe, 'interrupt, Bus, N>
 where
     Bus: UsbBus,
 {
     pub fn with_interrupt(
         allocate: &'alloc UsbBusAllocator<Bus>,
-        interchange: Requester<'pipe>,
+        interchange: Requester<'pipe, N>,
         interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
         initial_milliseconds: u32,
     ) -> Self {
@@ -112,7 +112,7 @@ where
     }
 
     // implement DerefMut<Target = Pipe> instead
-    pub fn pipe(&mut self) -> &mut Pipe<'alloc, 'pipe, 'interrupt, Bus> {
+    pub fn pipe(&mut self) -> &mut Pipe<'alloc, 'pipe, 'interrupt, Bus, N> {
         &mut self.pipe
     }
 
@@ -218,7 +218,7 @@ pub enum ClassRequests {
     SetProtocol = 0xB,
 }
 
-impl<Bus> UsbClass<Bus> for CtapHid<'_, '_, '_, Bus>
+impl<Bus, const N: usize> UsbClass<Bus> for CtapHid<'_, '_, '_, Bus, N>
 where
     Bus: UsbBus,
 {

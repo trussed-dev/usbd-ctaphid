@@ -30,15 +30,7 @@ use usb_device::{
     // Result as UsbResult,
 };
 
-use crate::{
-    constants::{
-        // 3072
-        MESSAGE_SIZE,
-        // 64
-        PACKET_SIZE,
-    },
-    types::KeepaliveStatus,
-};
+use crate::{constants::PACKET_SIZE, types::KeepaliveStatus};
 
 // https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#usb-hid-error
 // unused variants: InvalidParameter, LockRequired, Other
@@ -149,16 +141,16 @@ pub enum State {
     Sending((Response, MessageState)),
 }
 
-pub struct Pipe<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
+pub struct Pipe<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize> {
     read_endpoint: EndpointOut<'alloc, Bus>,
     write_endpoint: EndpointIn<'alloc, Bus>,
     state: State,
 
-    interchange: Requester<'pipe>,
+    interchange: Requester<'pipe, N>,
     interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
 
     // shared between requests and responses, due to size
-    buffer: [u8; MESSAGE_SIZE],
+    buffer: [u8; N],
 
     // we assign channel IDs one by one, this is the one last assigned
     // TODO: move into "app"
@@ -178,11 +170,11 @@ pub struct Pipe<'alloc, 'pipe, 'interrupt, Bus: UsbBus> {
     pub(crate) version: crate::Version,
 }
 
-impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, '_, Bus> {
+impl<'alloc, 'pipe, Bus: UsbBus, const N: usize> Pipe<'alloc, 'pipe, '_, Bus, N> {
     pub(crate) fn new(
         read_endpoint: EndpointOut<'alloc, Bus>,
         write_endpoint: EndpointIn<'alloc, Bus>,
-        interchange: Requester<'pipe>,
+        interchange: Requester<'pipe, N>,
         initial_milliseconds: u32,
     ) -> Self {
         Self {
@@ -190,7 +182,7 @@ impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, '_, Bus> {
             write_endpoint,
             state: State::Idle,
             interchange,
-            buffer: [0u8; MESSAGE_SIZE],
+            buffer: [0u8; N],
             last_channel: 0,
             interrupt: None,
             // Default to nothing implemented.
@@ -203,7 +195,9 @@ impl<'alloc, 'pipe, Bus: UsbBus> Pipe<'alloc, 'pipe, '_, Bus> {
     }
 }
 
-impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus> {
+impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
+    Pipe<'alloc, 'pipe, 'interrupt, Bus, N>
+{
     // pub fn borrow_mut_authenticator(&mut self) -> &mut Authenticator {
     //     &mut self.authenticator
     // }
@@ -211,7 +205,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
     pub(crate) fn with_interrupt(
         read_endpoint: EndpointOut<'alloc, Bus>,
         write_endpoint: EndpointIn<'alloc, Bus>,
-        interchange: Requester<'pipe>,
+        interchange: Requester<'pipe, N>,
         interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
         initial_milliseconds: u32,
     ) -> Self {
@@ -220,7 +214,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
             write_endpoint,
             state: State::Idle,
             interchange,
-            buffer: [0u8; MESSAGE_SIZE],
+            buffer: [0u8; N],
             last_channel: 0,
             interrupt,
             // Default to nothing implemented.
@@ -363,7 +357,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus> Pipe<'alloc, 'pipe, 'interrupt, Bus
                 }
             }
 
-            if length > MESSAGE_SIZE as u16 {
+            if length > N as u16 {
                 info!("Error message too big.");
                 self.send_error_now(current_request, AuthenticatorError::InvalidLength);
                 return;
