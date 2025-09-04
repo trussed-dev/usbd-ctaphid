@@ -528,7 +528,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
                 }
                 match self.interchange.request((
                     request.command,
-                    Bytes::from_slice(&self.buffer[..request.length as usize]).unwrap(),
+                    Bytes::try_from(&self.buffer[..request.length as usize]).unwrap(),
                 )) {
                     Ok(_) => {
                         self.state = State::WaitingOnAuthenticator(request);
