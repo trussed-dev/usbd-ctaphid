@@ -129,7 +129,7 @@ where
     /// Indicate whether or not a task should be scheduled to send keepalive messages.
     pub fn did_start_processing(&mut self) -> Status {
         if self.pipe.did_start_processing() {
-            Status::ReceivedData(250.milliseconds())
+            Status::ReceivedData(80.milliseconds())
         } else {
             Status::Idle
         }
@@ -138,7 +138,7 @@ where
     /// Send a keep alive message with 1 of 2 possible statuses.
     pub fn send_keepalive(&mut self, is_waiting_for_user_presence: bool) -> Status {
         if self.pipe.send_keepalive(is_waiting_for_user_presence) {
-            Status::ReceivedData(250.milliseconds())
+            Status::ReceivedData(80.milliseconds())
         } else {
             Status::Idle
         }
