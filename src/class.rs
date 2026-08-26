@@ -6,7 +6,7 @@ use ref_swap::OptionRefSwap;
 use trussed_core::InterruptFlag;
 
 use crate::{
-    constants::{INTERRUPT_POLL_MILLISECONDS, PACKET_SIZE},
+    constants::{INTERRUPT_POLL_INTERVAL, PACKET_SIZE},
     pipe::Pipe,
     types::Status,
 };
@@ -36,12 +36,12 @@ where
         interchange: Requester<'pipe, N>,
         initial_milliseconds: u32,
     ) -> Self {
-        // 64 bytes, interrupt endpoint polled every 5 milliseconds
+        // 64 bytes, bInterval 4: 4 ms at Full Speed, 1 ms at High Speed.
         let read_endpoint: EndpointOut<'alloc, Bus> =
-            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_MILLISECONDS);
-        // 64 bytes, interrupt endpoint polled every 5 milliseconds
+            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_INTERVAL);
+        // 64 bytes, bInterval 4: 4 ms at Full Speed, 1 ms at High Speed.
         let write_endpoint: EndpointIn<'alloc, Bus> =
-            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_MILLISECONDS);
+            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_INTERVAL);
 
         let pipe = Pipe::new(
             read_endpoint,
@@ -67,12 +67,12 @@ where
         interrupt: Option<&'interrupt OptionRefSwap<'interrupt, InterruptFlag>>,
         initial_milliseconds: u32,
     ) -> Self {
-        // 64 bytes, interrupt endpoint polled every 5 milliseconds
+        // 64 bytes, bInterval 4: 4 ms at Full Speed, 1 ms at High Speed.
         let read_endpoint: EndpointOut<'alloc, Bus> =
-            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_MILLISECONDS);
-        // 64 bytes, interrupt endpoint polled every 5 milliseconds
+            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_INTERVAL);
+        // 64 bytes, bInterval 4: 4 ms at Full Speed, 1 ms at High Speed.
         let write_endpoint: EndpointIn<'alloc, Bus> =
-            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_MILLISECONDS);
+            allocate.interrupt(PACKET_SIZE as u16, INTERRUPT_POLL_INTERVAL);
 
         let pipe = Pipe::with_interrupt(
             read_endpoint,

@@ -32,8 +32,14 @@ use usb_device::{
 
 use crate::{constants::PACKET_SIZE, types::KeepaliveStatus};
 
+// Immediate CTAPHID_ERROR replies do not use the main request/response state
+// machine.  Keep enough small, fixed-size slots for several host applications
+// contending for the authenticator without allocating in this no_std crate.
+const PENDING_ERROR_CAPACITY: usize = 8;
+
 // https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#usb-hid-error
 // unused variants: InvalidParameter, LockRequired, Other
+#[derive(Copy, Clone)]
 enum AuthenticatorError {
     ChannelBusy,
     InvalidChannel,
@@ -152,6 +158,11 @@ pub struct Pipe<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize> {
     // shared between requests and responses, due to size
     buffer: [u8; N],
 
+    // One-packet errors for competing channels.  These are kept separate from
+    // `state` and `buffer` so replying to another channel cannot corrupt the
+    // transaction currently being received, processed, or transmitted.
+    pending_errors: [Option<(u32, AuthenticatorError)>; PENDING_ERROR_CAPACITY],
+
     // we assign channel IDs one by one, this is the one last assigned
     // TODO: move into "app"
     last_channel: u32,
@@ -183,6 +194,7 @@ impl<'alloc, 'pipe, Bus: UsbBus, const N: usize> Pipe<'alloc, 'pipe, '_, Bus, N>
             state: State::Idle,
             interchange,
             buffer: [0u8; N],
+            pending_errors: [None; PENDING_ERROR_CAPACITY],
             last_channel: 0,
             interrupt: None,
             // Default to nothing implemented.
@@ -215,6 +227,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
             state: State::Idle,
             interchange,
             buffer: [0u8; N],
+            pending_errors: [None; PENDING_ERROR_CAPACITY],
             last_channel: 0,
             interrupt,
             // Default to nothing implemented.
@@ -301,7 +314,50 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
             info!("init");
 
             let command_number = packet[4] & !0x80;
+            let is_cancel = command_number == Command::Cancel.into_u8();
             // info_now!("command number {}", command_number);
+
+            if self.state != State::Idle {
+                let active_channel = match self.state {
+                    State::WaitingOnAuthenticator(request) | State::Receiving((request, _)) => {
+                        request.channel
+                    }
+                    State::WaitingToSend(response) | State::Sending((response, _)) => {
+                        response.channel
+                    }
+                    State::Idle => unreachable!(),
+                };
+
+                // CTAPHID_CANCEL is not a transaction of its own.  The
+                // specification requires a cancellation on a non-active CID to
+                // be ignored rather than answered with CHANNEL_BUSY.
+                if is_cancel && channel != active_channel {
+                    info_now!("Ignoring cancellation on non-active channel.");
+                    return;
+                }
+
+                if channel != active_channel {
+                    info_now!("busy.");
+                    self.send_error_now(channel, AuthenticatorError::ChannelBusy);
+                    return;
+                }
+
+                if command_number == Command::Init.into_u8() {
+                    info_now!("Resyncing!");
+                    self.cancel_ongoing_activity();
+                } else if is_cancel {
+                    info_now!("Cancelling");
+                    self.cancel_ongoing_activity();
+                    return;
+                } else {
+                    info_now!("Expected continuation packet.");
+                    self.start_sending_error_on_channel(
+                        active_channel,
+                        AuthenticatorError::InvalidSeq,
+                    );
+                    return;
+                }
+            }
 
             let command = match Command::try_from(command_number) {
                 Ok(command) => command,
@@ -327,39 +383,9 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
                 timestamp,
             };
 
-            if !(self.state == State::Idle) {
-                let request = match self.state {
-                    State::WaitingOnAuthenticator(request) => request,
-                    State::Receiving((request, _message_state)) => request,
-                    _ => {
-                        info_now!("Ignoring transaction as we're already transmitting.");
-                        return;
-                    }
-                };
-                if packet[4] == 0x86 {
-                    info_now!("Resyncing!");
-                    self.cancel_ongoing_activity();
-                } else {
-                    if channel == request.channel {
-                        if command == Command::Cancel {
-                            info_now!("Cancelling");
-                            self.cancel_ongoing_activity();
-                        } else {
-                            info_now!("Expected seq, {:?}", request.command);
-                            self.start_sending_error(request, AuthenticatorError::InvalidSeq);
-                        }
-                    } else {
-                        info_now!("busy.");
-                        self.send_error_now(current_request, AuthenticatorError::ChannelBusy);
-                    }
-
-                    return;
-                }
-            }
-
             if length > N as u16 {
                 info!("Error message too big.");
-                self.send_error_now(current_request, AuthenticatorError::InvalidLength);
+                self.send_error_now(current_request.channel, AuthenticatorError::InvalidLength);
                 return;
             }
 
@@ -377,9 +403,13 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
         } else {
             // case of continuation packet
             match self.state {
-                State::Receiving((request, mut message_state)) => {
+                State::Receiving((mut request, mut message_state)) => {
                     let sequence = packet[4];
                     // info_now!("receiving continuation packet {}", sequence);
+                    if channel != request.channel {
+                        info!("Ignore invalid channel");
+                        return;
+                    }
                     if sequence != message_state.next_sequence {
                         // error handling?
                         // info_now!("wrong sequence for continuation packet, expected {} received {}",
@@ -388,13 +418,14 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
                         self.start_sending_error(request, AuthenticatorError::InvalidSeq);
                         return;
                     }
-                    if channel != request.channel {
-                        // error handling?
-                        // info_now!("wrong channel for continuation packet, expected {} received {}",
-                        //           request.channel, channel);
-                        info!("Ignore invalid channel");
-                        return;
-                    }
+
+                    // The receive timeout protects against a client that starts
+                    // a fragmented message and then stops sending it.  It is an
+                    // inactivity timeout, so every valid continuation packet on
+                    // the active channel refreshes it.  Measuring from the init
+                    // packet makes a maximum-size message time out even while it
+                    // is making steady progress.
+                    request.timestamp = self.last_milliseconds;
 
                     let payload_length = request.length as usize;
                     if message_state.transmitted + (PACKET_SIZE - 5) < payload_length {
@@ -427,7 +458,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
         let last = self.last_milliseconds;
         self.last_milliseconds = milliseconds;
         if let State::Receiving((request, _message_state)) = &mut self.state {
-            if (milliseconds - last) > 200 {
+            if milliseconds.wrapping_sub(last) > 200 {
                 // If there's a lapse in `check_timeout(...)` getting called (e.g. due to logging),
                 // this could lead to inaccurate timestamps on requests.  So we'll
                 // just "forgive" requests temporarily if this happens.
@@ -438,9 +469,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
                 request.timestamp = milliseconds;
             }
             // compare keeping in mind of possible overflow in timestamp.
-            else if (milliseconds > request.timestamp && (milliseconds - request.timestamp) > 550)
-                || (milliseconds < request.timestamp && milliseconds > 550)
-            {
+            else if milliseconds.wrapping_sub(request.timestamp) > 550 {
                 debug!(
                     "Channel timeout. {}, {}, {}",
                     request.timestamp, milliseconds, last
@@ -538,7 +567,7 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
                         // busy
                         info_now!("STATE: {:?}", self.interchange.state());
                         info!("can't handle more than one authenticator request at a time.");
-                        self.send_error_now(request, AuthenticatorError::ChannelBusy);
+                        self.send_error_now(request.channel, AuthenticatorError::ChannelBusy);
                     }
                 }
             }
@@ -640,22 +669,57 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
         self.start_sending(response);
     }
 
-    fn send_error_now(&mut self, request: Request, error: AuthenticatorError) {
-        let last_state = core::mem::replace(&mut self.state, State::Idle);
-        let last_first_byte = self.buffer[0];
+    fn send_error_now(&mut self, channel: u32, error: AuthenticatorError) {
+        let error = (channel, error);
+        if self.pending_errors[0].is_none() && self.write_error_packet(error) {
+            return;
+        }
 
-        self.buffer[0] = error as u8;
-        let response = Response::error_from_request(request);
-        self.start_sending(response);
-        self.maybe_write_packet();
+        // Coalesce repeated retries from one channel until its existing error
+        // has been sent.  A conforming client waits for that response before
+        // starting another request on the same channel.
+        if self
+            .pending_errors
+            .iter()
+            .flatten()
+            .any(|(channel, _)| *channel == error.0)
+        {
+            return;
+        }
 
-        self.state = last_state;
-        self.buffer[0] = last_first_byte;
+        if let Some(slot) = self.pending_errors.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(error);
+        } else {
+            warn_now!("CTAPHID immediate error queue is full");
+        }
+    }
+
+    fn write_error_packet(&mut self, (channel, error): (u32, AuthenticatorError)) -> bool {
+        let mut packet = [0u8; PACKET_SIZE];
+        packet[..4].copy_from_slice(&channel.to_be_bytes());
+        packet[4] = ctaphid_dispatch::app::Command::Error.into_u8() | 0x80;
+        packet[5..7].copy_from_slice(&1u16.to_be_bytes());
+        packet[7] = error.into();
+
+        match self.write_endpoint.write(&packet) {
+            Err(UsbError::WouldBlock) => false,
+            Err(_) => panic!("unexpected error writing packet!"),
+            Ok(PACKET_SIZE) => true,
+            Ok(_) => panic!("unexpected size writing packet!"),
+        }
     }
 
     // called from poll, and when a packet has been sent
     #[inline(never)]
     pub(crate) fn maybe_write_packet(&mut self) {
+        if let Some(error) = self.pending_errors[0] {
+            if self.write_error_packet(error) {
+                self.pending_errors.rotate_left(1);
+                self.pending_errors[PENDING_ERROR_CAPACITY - 1] = None;
+            }
+            return;
+        }
+
         match self.state {
             State::WaitingToSend(response) => {
                 // zeros leftover bytes
@@ -669,7 +733,6 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
                 if fits_in_one_packet {
                     packet[7..][..response.length as usize]
                         .copy_from_slice(&self.buffer[..response.length as usize]);
-                    self.state = State::Idle;
                 } else {
                     packet[7..].copy_from_slice(&self.buffer[..PACKET_SIZE - 7]);
                 }
@@ -767,5 +830,442 @@ impl<'alloc, 'pipe, 'interrupt, Bus: UsbBus, const N: usize>
             // nothing to send
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use self::std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+        vec::Vec,
+    };
+    use super::*;
+    use usb_device::{
+        bus::{PollResult, UsbBusAllocator},
+        device::{UsbDeviceBuilder, UsbVidPid},
+        endpoint::EndpointType,
+        UsbDirection,
+    };
+
+    const MESSAGE_SIZE: usize = 7609;
+    const ACTIVE_CHANNEL: u32 = 0x01020304;
+    const OTHER_CHANNEL: u32 = 0x05060708;
+    const THIRD_CHANNEL: u32 = 0x090a0b0c;
+
+    #[derive(Default)]
+    struct TestBusState {
+        reads: VecDeque<[u8; PACKET_SIZE]>,
+        writes: Vec<[u8; PACKET_SIZE]>,
+        block_writes: bool,
+    }
+
+    struct TestBus {
+        state: Arc<Mutex<TestBusState>>,
+        next_in: usize,
+        next_out: usize,
+    }
+
+    impl TestBus {
+        fn new(state: Arc<Mutex<TestBusState>>) -> Self {
+            Self {
+                state,
+                next_in: 1,
+                next_out: 1,
+            }
+        }
+    }
+
+    impl UsbBus for TestBus {
+        fn alloc_ep(
+            &mut self,
+            direction: UsbDirection,
+            address: Option<EndpointAddress>,
+            _endpoint_type: EndpointType,
+            _max_packet_size: u16,
+            _interval: u8,
+        ) -> usb_device::Result<EndpointAddress> {
+            if let Some(address) = address {
+                return Ok(address);
+            }
+            let index = match direction {
+                UsbDirection::In => {
+                    let index = self.next_in;
+                    self.next_in += 1;
+                    index
+                }
+                UsbDirection::Out => {
+                    let index = self.next_out;
+                    self.next_out += 1;
+                    index
+                }
+            };
+            Ok(EndpointAddress::from_parts(index, direction))
+        }
+
+        fn enable(&mut self) {}
+        fn reset(&self) {}
+        fn set_device_address(&self, _address: u8) {}
+
+        fn write(&self, _address: EndpointAddress, data: &[u8]) -> usb_device::Result<usize> {
+            let mut state = self.state.lock().unwrap();
+            if state.block_writes {
+                return Err(UsbError::WouldBlock);
+            }
+            let packet: [u8; PACKET_SIZE] = data.try_into().unwrap();
+            state.writes.push(packet);
+            Ok(data.len())
+        }
+
+        fn read(&self, _address: EndpointAddress, data: &mut [u8]) -> usb_device::Result<usize> {
+            let packet = self
+                .state
+                .lock()
+                .unwrap()
+                .reads
+                .pop_front()
+                .ok_or(UsbError::WouldBlock)?;
+            data.copy_from_slice(&packet);
+            Ok(packet.len())
+        }
+
+        fn set_stalled(&self, _address: EndpointAddress, _stalled: bool) {}
+        fn is_stalled(&self, _address: EndpointAddress) -> bool {
+            false
+        }
+        fn suspend(&self) {}
+        fn resume(&self) {}
+        fn poll(&self) -> PollResult {
+            PollResult::None
+        }
+    }
+
+    fn with_pipe(
+        test: impl FnOnce(&mut Pipe<'_, '_, '_, TestBus, MESSAGE_SIZE>, &Arc<Mutex<TestBusState>>),
+    ) {
+        let state = Arc::new(Mutex::new(TestBusState::default()));
+        let allocator = UsbBusAllocator::new(TestBus::new(Arc::clone(&state)));
+        let channel = ctaphid_dispatch::Channel::<MESSAGE_SIZE>::new();
+        let (requester, _responder) = channel.split().unwrap();
+        let read_endpoint: EndpointOut<'_, TestBus> = allocator.interrupt(PACKET_SIZE as u16, 5);
+        let write_endpoint: EndpointIn<'_, TestBus> = allocator.interrupt(PACKET_SIZE as u16, 5);
+        let mut pipe = Pipe::new(read_endpoint, write_endpoint, requester, 0);
+        let _device = UsbDeviceBuilder::new(&allocator, UsbVidPid(0x1209, 0xbeee)).build();
+
+        test(&mut pipe, &state);
+    }
+
+    fn request(channel: u32, command: Command, length: u16) -> Request {
+        Request {
+            channel,
+            command,
+            length,
+            timestamp: 0,
+        }
+    }
+
+    fn initialization_packet(channel: u32, command: Command, length: u16) -> [u8; PACKET_SIZE] {
+        let mut packet = [0u8; PACKET_SIZE];
+        packet[..4].copy_from_slice(&channel.to_be_bytes());
+        packet[4] = command.into_u8() | 0x80;
+        packet[5..7].copy_from_slice(&length.to_be_bytes());
+        packet
+    }
+
+    fn unknown_command_packet(channel: u32) -> [u8; PACKET_SIZE] {
+        let mut packet = [0u8; PACKET_SIZE];
+        packet[..4].copy_from_slice(&channel.to_be_bytes());
+        packet[4] = 0xfe;
+        packet
+    }
+
+    fn continuation_packet(channel: u32, sequence: u8) -> [u8; PACKET_SIZE] {
+        let mut packet = [0u8; PACKET_SIZE];
+        packet[..4].copy_from_slice(&channel.to_be_bytes());
+        packet[4] = sequence;
+        packet
+    }
+
+    fn assert_busy_error(packet: &[u8; PACKET_SIZE]) {
+        assert_error(packet, OTHER_CHANNEL, 0x06);
+    }
+
+    fn assert_error(packet: &[u8; PACKET_SIZE], channel: u32, error: u8) {
+        assert_eq!(&packet[..4], &channel.to_be_bytes());
+        assert_eq!(packet[4], Command::Error.into_u8() | 0x80);
+        assert_eq!(&packet[5..7], &1u16.to_be_bytes());
+        assert_eq!(packet[7], error);
+    }
+
+    #[test]
+    fn competing_channel_receives_channel_busy() {
+        with_pipe(|pipe, bus| {
+            let active = State::Receiving((
+                request(ACTIVE_CHANNEL, Command::Ping, 100),
+                MessageState::default(),
+            ));
+            pipe.state = active.clone();
+            bus.lock().unwrap().reads.push_back(initialization_packet(
+                OTHER_CHANNEL,
+                Command::Ping,
+                0,
+            ));
+
+            pipe.read_and_handle_packet();
+
+            let bus = bus.lock().unwrap();
+            assert_eq!(pipe.state, active);
+            assert_eq!(bus.writes.len(), 1);
+            assert_busy_error(&bus.writes[0]);
+        });
+    }
+
+    #[test]
+    fn foreign_continuation_does_not_abort_active_channel() {
+        with_pipe(|pipe, bus| {
+            let message_state = MessageState {
+                next_sequence: 3,
+                ..MessageState::default()
+            };
+            let active =
+                State::Receiving((request(ACTIVE_CHANNEL, Command::Ping, 200), message_state));
+            pipe.state = active.clone();
+            bus.lock()
+                .unwrap()
+                .reads
+                .push_back(continuation_packet(OTHER_CHANNEL, 0));
+
+            pipe.read_and_handle_packet();
+
+            let bus = bus.lock().unwrap();
+            assert_eq!(pipe.state, active);
+            assert!(bus.writes.is_empty());
+        });
+    }
+
+    #[test]
+    fn unknown_command_on_competing_channel_receives_busy() {
+        with_pipe(|pipe, bus| {
+            let active = State::Receiving((
+                request(ACTIVE_CHANNEL, Command::Ping, 100),
+                MessageState::default(),
+            ));
+            pipe.state = active.clone();
+            bus.lock()
+                .unwrap()
+                .reads
+                .push_back(unknown_command_packet(OTHER_CHANNEL));
+
+            pipe.read_and_handle_packet();
+
+            let bus = bus.lock().unwrap();
+            assert_eq!(pipe.state, active);
+            assert_eq!(bus.writes.len(), 1);
+            assert_busy_error(&bus.writes[0]);
+        });
+    }
+
+    #[test]
+    fn cancel_on_non_active_channel_is_ignored() {
+        with_pipe(|pipe, bus| {
+            let active = State::Sending((
+                Response::from_request_and_size(request(ACTIVE_CHANNEL, Command::Ping, 100), 100),
+                MessageState::default(),
+            ));
+            pipe.state = active.clone();
+            bus.lock().unwrap().reads.push_back(initialization_packet(
+                OTHER_CHANNEL,
+                Command::Cancel,
+                0,
+            ));
+
+            pipe.read_and_handle_packet();
+
+            let bus = bus.lock().unwrap();
+            assert_eq!(pipe.state, active);
+            assert!(bus.writes.is_empty());
+        });
+    }
+
+    #[test]
+    fn valid_continuations_refresh_receive_timeout() {
+        with_pipe(|pipe, bus| {
+            pipe.last_milliseconds = 500;
+            pipe.state = State::Receiving((
+                request(ACTIVE_CHANNEL, Command::Ping, 200),
+                MessageState::default(),
+            ));
+            bus.lock()
+                .unwrap()
+                .reads
+                .push_back(continuation_packet(ACTIVE_CHANNEL, 0));
+
+            pipe.read_and_handle_packet();
+
+            let State::Receiving((request, message_state)) = pipe.state else {
+                panic!("pipe stopped receiving a message that was making progress");
+            };
+            assert_eq!(request.timestamp, 500);
+            assert_eq!(message_state.next_sequence, 1);
+
+            // More than 550 ms from the initialization packet, but only 400 ms
+            // from the last valid continuation packet: the request is alive.
+            pipe.check_timeout(700);
+            pipe.check_timeout(900);
+            assert!(matches!(pipe.state, State::Receiving(_)));
+            assert!(bus.lock().unwrap().writes.is_empty());
+
+            // It is aborted after 550 ms without another valid packet.
+            pipe.check_timeout(1051);
+            let bus = bus.lock().unwrap();
+            assert_eq!(bus.writes.len(), 1);
+            assert_eq!(&bus.writes[0][..4], &ACTIVE_CHANNEL.to_be_bytes());
+            assert_eq!(bus.writes[0][4], Command::Error.into_u8() | 0x80);
+            assert_eq!(&bus.writes[0][5..7], &1u16.to_be_bytes());
+            assert_eq!(bus.writes[0][7], 0x05);
+        });
+    }
+
+    #[test]
+    fn competing_channel_receives_busy_while_response_is_sending() {
+        with_pipe(|pipe, bus| {
+            let active = State::Sending((
+                Response::from_request_and_size(request(ACTIVE_CHANNEL, Command::Ping, 100), 100),
+                MessageState::default(),
+            ));
+            pipe.state = active.clone();
+            bus.lock().unwrap().reads.push_back(initialization_packet(
+                OTHER_CHANNEL,
+                Command::Ping,
+                0,
+            ));
+
+            pipe.read_and_handle_packet();
+
+            let bus = bus.lock().unwrap();
+            assert_eq!(pipe.state, active);
+            assert_eq!(bus.writes.len(), 1);
+            assert_busy_error(&bus.writes[0]);
+        });
+    }
+
+    #[test]
+    fn busy_error_is_retried_when_endpoint_would_block() {
+        with_pipe(|pipe, bus| {
+            let active = State::Receiving((
+                request(ACTIVE_CHANNEL, Command::Ping, 100),
+                MessageState::default(),
+            ));
+            pipe.state = active.clone();
+            {
+                let mut bus = bus.lock().unwrap();
+                bus.block_writes = true;
+                bus.reads
+                    .push_back(initialization_packet(OTHER_CHANNEL, Command::Ping, 0));
+            }
+
+            pipe.read_and_handle_packet();
+            assert_eq!(pipe.state, active);
+            assert_eq!(pipe.pending_errors.iter().flatten().count(), 1);
+
+            bus.lock().unwrap().block_writes = false;
+            pipe.maybe_write_packet();
+
+            let bus = bus.lock().unwrap();
+            assert_eq!(pipe.state, active);
+            assert!(pipe.pending_errors.iter().all(Option::is_none));
+            assert_eq!(bus.writes.len(), 1);
+            assert_busy_error(&bus.writes[0]);
+        });
+    }
+
+    #[test]
+    fn pending_error_queue_keeps_out_endpoint_draining() {
+        with_pipe(|pipe, bus| {
+            pipe.state = State::Receiving((
+                request(ACTIVE_CHANNEL, Command::Ping, 100),
+                MessageState::default(),
+            ));
+            {
+                let mut bus = bus.lock().unwrap();
+                bus.block_writes = true;
+                bus.reads
+                    .push_back(initialization_packet(OTHER_CHANNEL, Command::Ping, 0));
+                bus.reads
+                    .push_back(initialization_packet(THIRD_CHANNEL, Command::Ping, 0));
+            }
+
+            pipe.read_and_handle_packet();
+            pipe.read_and_handle_packet();
+            assert_eq!(pipe.pending_errors.iter().flatten().count(), 2);
+            assert!(bus.lock().unwrap().reads.is_empty());
+
+            // Once IN accepts reports, drain the errors in arrival order.
+            bus.lock().unwrap().block_writes = false;
+            pipe.maybe_write_packet();
+            assert_eq!(pipe.pending_errors.iter().flatten().count(), 1);
+            pipe.maybe_write_packet();
+
+            let bus = bus.lock().unwrap();
+            assert!(pipe.pending_errors.iter().all(Option::is_none));
+            assert!(bus.reads.is_empty());
+            assert_eq!(bus.writes.len(), 2);
+            assert_error(&bus.writes[0], OTHER_CHANNEL, 0x06);
+            assert_error(&bus.writes[1], THIRD_CHANNEL, 0x06);
+        });
+    }
+
+    #[test]
+    fn pending_error_queue_coalesces_retries_from_one_channel() {
+        with_pipe(|pipe, bus| {
+            pipe.state = State::Receiving((
+                request(ACTIVE_CHANNEL, Command::Ping, 100),
+                MessageState::default(),
+            ));
+            {
+                let mut bus = bus.lock().unwrap();
+                bus.block_writes = true;
+                bus.reads
+                    .push_back(initialization_packet(OTHER_CHANNEL, Command::Ping, 0));
+                bus.reads
+                    .push_back(initialization_packet(OTHER_CHANNEL, Command::Ping, 0));
+            }
+
+            pipe.read_and_handle_packet();
+            pipe.read_and_handle_packet();
+
+            assert_eq!(pipe.pending_errors.iter().flatten().count(), 1);
+            assert!(bus.lock().unwrap().reads.is_empty());
+        });
+    }
+
+    #[test]
+    fn single_packet_response_is_retried_when_endpoint_would_block() {
+        with_pipe(|pipe, bus| {
+            pipe.buffer[0] = 0x42;
+            pipe.state = State::WaitingToSend(Response::from_request_and_size(
+                request(ACTIVE_CHANNEL, Command::Ping, 1),
+                1,
+            ));
+            bus.lock().unwrap().block_writes = true;
+
+            pipe.maybe_write_packet();
+
+            assert!(matches!(pipe.state, State::WaitingToSend(_)));
+            assert!(bus.lock().unwrap().writes.is_empty());
+
+            bus.lock().unwrap().block_writes = false;
+            pipe.maybe_write_packet();
+
+            let bus = bus.lock().unwrap();
+            assert_eq!(pipe.state, State::Idle);
+            assert_eq!(bus.writes.len(), 1);
+            assert_eq!(&bus.writes[0][..4], &ACTIVE_CHANNEL.to_be_bytes());
+            assert_eq!(bus.writes[0][4], Command::Ping.into_u8() | 0x80);
+            assert_eq!(&bus.writes[0][5..7], &1u16.to_be_bytes());
+            assert_eq!(bus.writes[0][7], 0x42);
+        });
     }
 }
